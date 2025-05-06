@@ -1,6 +1,7 @@
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
 from transformers import T5Tokenizer, T5ForConditionalGeneration
+from transformers import pipeline
 import torch
 import numpy as np
 # Taken from Mastering Pytorch, p500
@@ -33,10 +34,15 @@ def translate():
     outputs = model.generate(input_ids)
     print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
+def next_token(model):
+    unmasker = pipeline('fill-mask', model=model)
+    print(unmasker("Hello I'm a [MASK] model."))
+
 
 def play_with_bert():
     # a pre-trained model from HuggingFace
     model_name = "bert-base-uncased"
+    next_token(model_name)
     # Load the pre-trained model and tokenizer
     model = AutoModelForSequenceClassification.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
