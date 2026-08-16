@@ -9,11 +9,12 @@ from transformers import pipeline
 
 
 
-def inference(model, tokenizer):
-    input_text = "I love PyTorch!"
+def classify(model, tokenizer):
+    print(model.config.id2label)
+    input_text = "Shall I compare thee to a Summer's day? Thou art more fair and temperate."
     # Tokenize the input text using the tokenizer
-    inputs = tokenizer(input_text, return_tensors="pt")
-    print(f"inputs shape = {np.shape(inputs)}")
+    inputs = tokenizer(input_text, return_tensors="pt")  # inputs.attention_mask are for padding, inputs.token_type_ids for question/answer tasks
+    examine_tokens(inputs, tokenizer)
 
     # Perform inference using the pre-trained model
     with torch.no_grad():
@@ -25,7 +26,17 @@ def inference(model, tokenizer):
     print(f"logits = {logits}")
     predicted_class = torch.argmax(logits, dim=1).item()
 
-    print(predicted_class)
+    print(predicted_class)  # this is garbage until we've trained fine tuned the model
+
+
+def examine_tokens(inputs, tokenizer):
+    print(f"inputs shape = {np.shape(inputs)}")
+    print(f"inputs = {inputs}")
+    word_ids = inputs.input_ids[0, 1:-1]  # CLS and SEP are always the first and last
+    print("Tokens:")
+    for token in tokenizer.convert_ids_to_tokens(word_ids):
+        print("\t" + token)
+
 
 def translate():
     tokenizer = T5Tokenizer.from_pretrained("t5-small")
@@ -34,6 +45,7 @@ def translate():
                           return_tensors="pt").input_ids
     outputs = model.generate(input_ids)
     print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+
 
 def next_token(model):
     unmasker = pipeline('fill-mask', model=model)
@@ -47,9 +59,10 @@ def play_with_bert():
     # next_token(model_name)
     # Load the pre-trained model and tokenizer
     model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    print("model is of type ", type(model))  # transformers.models.bert.modeling_bert.BertForSequenceClassification
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    classify(model, tokenizer)
     translate()
-    inference(model, tokenizer)
 
 
 if __name__ == "__main__":
