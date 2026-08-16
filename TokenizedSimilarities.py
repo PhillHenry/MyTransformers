@@ -20,9 +20,12 @@ def cosine_similarities(vectors):
 
 
 def print_similarities(data, similarities):
-    for i in range(len(data)):
-        for j in range(i + 1, len(data)):
-            print(f"{similarities[i, j]:.4f}\t{data[i]!r}\n\tvs\t{data[j]!r}")
+    """Every pair once, most similar first."""
+    pairs = [(similarities[i, j].item(), i, j)
+             for i in range(len(data))
+             for j in range(i + 1, len(data))]
+    for score, i, j in sorted(pairs, reverse=True):
+        print(f"{score:.4f}\t{data[i]!r}\n\tvs\t{data[j]!r}")
 
 
 def do_similarities():
@@ -33,7 +36,7 @@ def do_similarities():
         "Mr Smith, 102 Van Ness, San Francisco",
         "Jane Smith, 12 High St., London",
     ]
-    model_name = "bert-base-uncased"
+    model_name = "sentence-transformers/all-MiniLM-L6-v2"
     model = AutoModel.from_pretrained(model_name)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
