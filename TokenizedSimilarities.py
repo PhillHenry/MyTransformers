@@ -35,6 +35,7 @@ def do_similarities():
         "E. J. Thribb, 24 Acacia Avenue, London",
         "Mr Smith, 102 Van Ness, San Francisco",
         "Jane Smith, 12 High St., London",
+        "Janet Smith, 14 High St., London", # this confuses the Jane Smith record a little
     ]
     model_name = "sentence-transformers/all-MiniLM-L6-v2"
     model = AutoModel.from_pretrained(model_name)
