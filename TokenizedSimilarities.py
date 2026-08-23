@@ -2,9 +2,9 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 
-def embed(model, tokenizer, data):
+def embed(model, tokenizer, records: [str]):
     """One vector per string: the mean of its token embeddings, ignoring padding."""
-    inputs = tokenizer(data, return_tensors="pt", padding=True, truncation=True)
+    inputs = tokenizer(records, return_tensors="pt", padding=True, truncation=True)
     with torch.no_grad():
         outputs = model(**inputs)
     token_vectors = outputs.last_hidden_state         # [batch, tokens, hidden]
@@ -28,14 +28,22 @@ def print_similarities(data, similarities):
         print(f"{score:.4f}\t{data[i]!r}\n\tvs\t{data[j]!r}")
 
 
+def describe_mebeddings(tokenizer, records: [str]):
+    inputs = tokenizer(records, return_tensors="pt", padding=True, truncation=True)
+    for record, encoding in zip(records, inputs.encodings):
+        print(f"{record} -> {encoding.tokens}")
+
+
 def do_similarities():
+    jane = "Jane Smith, 12 High St., London"
+    janet = "Janet Smith, 14 High St., London"
     data = [
         "John Smith, 12 High St., London",
         "J. Smith, 12 High Street, London",
         "E. J. Thribb, 24 Acacia Avenue, London",
         "Mr Smith, 102 Van Ness, San Francisco",
-        "Jane Smith, 12 High St., London",
-        "Janet Smith, 14 High St., London", # this confuses the Jane Smith record a little
+        jane,
+        janet, # this confuses the Jane Smith record a little
     ]
     model_name = "sentence-transformers/all-MiniLM-L6-v2"
     model = AutoModel.from_pretrained(model_name)
@@ -46,6 +54,7 @@ def do_similarities():
     print(f"vectors shape = {tuple(vectors.shape)}")
 
     similarities = cosine_similarities(vectors)
+    print(describe_mebeddings(tokenizer, [jane, janet]))
     print(f"similarities shape = {tuple(similarities.shape)}")
     print(similarities)
     print_similarities(data, similarities)
