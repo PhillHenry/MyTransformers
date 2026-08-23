@@ -1,6 +1,8 @@
 import torch
 from transformers import AutoModel, AutoTokenizer
 
+jane = "Jane Smith, 12 High St., London"
+janet = "Janet Smith, 14 High St., London"
 
 def embed(model, tokenizer, records: [str]):
     """One vector per string: the mean of its token embeddings, ignoring padding."""
@@ -34,17 +36,7 @@ def describe_mebeddings(tokenizer, records: [str]):
         print(f"{record} -> {encoding.tokens}")
 
 
-def do_similarities():
-    jane = "Jane Smith, 12 High St., London"
-    janet = "Janet Smith, 14 High St., London"
-    data = [
-        "John Smith, 12 High St., London",
-        "J. Smith, 12 High Street, London",
-        "E. J. Thribb, 24 Acacia Avenue, London",
-        "Mr Smith, 102 Van Ness, San Francisco",
-        jane,
-        janet, # this confuses the Jane Smith record a little
-    ]
+def do_similarities(data: [str]):
     model_name = "sentence-transformers/all-MiniLM-L6-v2"
     model = AutoModel.from_pretrained(model_name)
     model.eval()
@@ -54,11 +46,29 @@ def do_similarities():
     print(f"vectors shape = {tuple(vectors.shape)}")
 
     similarities = cosine_similarities(vectors)
-    print(describe_mebeddings(tokenizer, [jane, janet]))
     print(f"similarities shape = {tuple(similarities.shape)}")
     print(similarities)
     print_similarities(data, similarities)
+    return tokenizer
 
 
 if __name__ == "__main__":
-    do_similarities()
+    tokenizer = do_similarities(
+        [
+            "John Smith, 12 High St., London",
+            "J. Smith, 12 High Street, London",
+            "E. J. Thribb, 24 Acacia Avenue, London",
+            "Mr Smith, 102 Van Ness, San Francisco",
+            jane,
+            janet,  # this confuses the Jane Smith record a little
+        ]
+    )
+    print(describe_mebeddings(tokenizer, [jane, janet]))
+    do_similarities(
+        [
+            "Phil Henry, 30 Acacia Avenue, London",
+            "Phillip Henry, 30 Acacia Ave., London",
+            jane,
+            janet,  # this confuses the Jane Smith record a little
+        ]
+    )
