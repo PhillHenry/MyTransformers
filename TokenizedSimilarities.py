@@ -72,3 +72,33 @@ if __name__ == "__main__":
             janet,  # this confuses the Jane Smith record a little
         ]
     )
+    do_similarities(
+        [
+            "Phil Henry, 30 Acacia Avenue, London",
+            "Phillip Henry, 300 Acacia Ave., London", # closest to the above
+            "John Smith, 300 Acacia Ave., London",
+            jane,
+            janet,  # this confuses the Jane Smith record a little
+        ]
+    )
+    do_similarities(
+        [
+            "Phil Henry, 30 Acacia Avenue, London",
+            "Henry Phillips, 300 Acacia Ave., London",  # closest to the above
+            "John Smith, 300 Acacia Ave., London",
+            jane,
+            janet,  # this confuses the Jane Smith record a little
+        ]
+    )
+    do_similarities(
+        [
+            "Phil Henry, 30 Acacia Avenue, London",
+            "Philip Henry, 30 Acacia Avenue, London",
+            "Phillip Henry, 30 Acacia Avenue, London",
+            "P Henry, 30 Acacia Avenue, London",
+            "Henry Phillips, 300 Acacia Ave., London",
+            "John Smith, 300 Acacia Ave., London",
+            jane,
+            janet,  # this confuses the Jane Smith record a little
+        ]
+    )
