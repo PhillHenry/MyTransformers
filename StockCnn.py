@@ -1,8 +1,11 @@
 """A 1D CNN that flags bars from which price is likely to rise 2% within the next 20 rows.
 
 Reads a CSV of `timestamp,open,high,low,close,volume`, turns it into overlapping
-windows of scale-free features, and trains a convolutional classifier on the
-binary label "did the high, at any point in the next H rows, reach close * 1.02?".
+windows of scale-free features, and trains a convolutional classifier on the binary
+label "did the high reach close * 1.02 within the next H rows *and* before midnight?".
+
+The same-calendar-day constraint means the effective horizon shrinks as the session
+runs down, so the timestamp itself becomes predictive and is fed in as a feature.
 
 Run without arguments for a synthetic random-walk demo:
     python StockCnn.py
@@ -11,32 +14,69 @@ Or against real data:
 """
 import argparse
 import csv
+import datetime as dt
 import math
 
 import numpy as np
 import torch
 from torch import nn
 
-FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close", "log_volume_change"]
+FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close", "log_volume_change",
+                 "time_of_day", "bars_elapsed_today"]
+
+
+def parse_timestamp(raw: str) -> dt.datetime:
+    """ISO-8601 (with or without a `T`, `Z` or offset) or an epoch number in seconds/millis."""
+    text = raw.strip()
+    try:
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    number = float(text)
+    return dt.datetime.fromtimestamp(number / 1000.0 if number > 1e11 else number, tz=dt.timezone.utc)
 
 
 def read_csv(path: str):
-    """Rows sorted by timestamp, as float columns. Timestamps are kept only for ordering/reporting."""
+    """Rows sorted by timestamp: the parsed timestamps and the OHLCV columns as floats.
+
+    The timestamps are no longer just for ordering — the calendar day decides where
+    each label's look-ahead window is cut off.
+    """
     with open(path, newline="") as handle:
         rows = list(csv.DictReader(handle))
-    rows.sort(key=lambda row: row["timestamp"])
-    timestamps = [row["timestamp"] for row in rows]
+    timestamps = sorted(parse_timestamp(row["timestamp"]) for row in rows)
+    rows.sort(key=lambda row: parse_timestamp(row["timestamp"]))
     prices = np.array([[float(row[c]) for c in ("open", "high", "low", "close", "volume")] for row in rows],
                       dtype=np.float64)
     return timestamps, prices
 
 
-def features_and_labels(prices, horizon: int, target: float):
+def calendar_columns(timestamps):
+    """Day number (for grouping) and time of day as a fraction, per row.
+
+    Mixed time zones in one file would put bars in the wrong day, so if the stamps
+    are offset-aware they are all converted to the first one's zone before the date
+    is taken.
+    """
+    if timestamps and timestamps[0].tzinfo is not None:
+        zone = timestamps[0].tzinfo
+        timestamps = [t.astimezone(zone) for t in timestamps]
+    days = np.array([t.date().toordinal() for t in timestamps], dtype=np.int64)
+    seconds = np.array([t.hour * 3600 + t.minute * 60 + t.second for t in timestamps], dtype=np.float64)
+    return days, seconds / 86400.0
+
+
+def features_and_labels(prices, days, time_of_day, horizon: int, target: float):
     """Per-row features plus the forward-looking label, aligned on the same index.
 
-    Features are ratios/differences so the net never sees the absolute price level:
-    a model trained on a $10 stock should still work when it trades at $200.
+    Price features are ratios/differences so the net never sees the absolute price
+    level: a model trained on a $10 stock should still work when it trades at $200.
     Row 0 is dropped because the return features need a previous row.
+
+    The label for row i is 1 when some bar in rows i+1 .. i+horizon *that falls on the
+    same calendar day as row i* trades at or above close[i] * (1 + target). Rows near
+    the close therefore have fewer chances, which is why the clock is a feature: with
+    no notion of time the model could only average over "how much day is left".
     """
     open_, high, low, close, volume = (prices[:, i] for i in range(5))
 
@@ -46,15 +86,27 @@ def features_and_labels(prices, horizon: int, target: float):
     open_vs_close = (open_[1:] / close[1:]) - 1.0
     log_volume_change = np.diff(np.log1p(volume))
 
-    features = np.stack([log_return, high_vs_close, low_vs_close, open_vs_close, log_volume_change], axis=1)
+    days, time_of_day = days[1:], time_of_day[1:]
+    # How far into its day each bar is, counted in bars: the clock as the data actually
+    # samples it, which is what limits how many chances the 2% move has left.
+    _, first_of_day = np.unique(days, return_index=True)
+    bars_elapsed = np.arange(len(days)) - np.repeat(first_of_day, np.diff(np.append(first_of_day, len(days))))
 
-    # Label for row i: does any of the next `horizon` bars trade at or above close[i] * (1 + target)?
-    close_ = close[1:]
-    high_ = high[1:]
+    features = np.stack([log_return, high_vs_close, low_vs_close, open_vs_close, log_volume_change,
+                         time_of_day, np.log1p(bars_elapsed)], axis=1)
+
+    close_, high_ = close[1:], high[1:]
     n = len(close_)
     labels = np.full(n, np.nan)
-    for i in range(n - horizon):
-        labels[i] = 1.0 if high_[i + 1:i + 1 + horizon].max() >= close_[i] * (1.0 + target) else 0.0
+    for i in range(n):
+        stop = min(i + horizon, n - 1)                       # last row the horizon reaches
+        ahead = high_[i + 1:stop + 1][days[i + 1:stop + 1] == days[i]]
+        if ahead.size and ahead.max() >= close_[i] * (1.0 + target):
+            labels[i] = 1.0
+        elif i + horizon > n - 1 and days[i] == days[-1]:
+            labels[i] = np.nan                               # this day may continue past the file
+        else:
+            labels[i] = 0.0                                  # includes bars whose day simply ran out
 
     return features.astype(np.float32), labels.astype(np.float32)
 
@@ -189,34 +241,39 @@ def train(model, train_split, validation_split, device, epochs: int, batch_size:
     return model
 
 
-def synthetic_csv(path: str, rows: int = 20000, seed: int = 0):
+def synthetic_csv(path: str, days: int = 52, bars_per_day: int = 390, seed: int = 0):
     """A random walk in which a volume spike precedes a burst of upward drift.
 
     Purely to have something learnable to demo against: the signal is a spike
     followed `lead` bars later by positive drift, which is exactly the sort of
     local, shift-invariant pattern a CNN over a window should be able to find.
+    Bars are one minute apart from 09:30, so the calendar day actually bites.
     """
     rng = np.random.default_rng(seed)
-    price, drift, lead, countdown = 100.0, 0.0, 5, 0
+    session_start = dt.datetime(2024, 1, 1, 9, 30)
+    price, lead = 100.0, 5
     with open(path, "w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["timestamp", "open", "high", "low", "close", "volume"])
-        for i in range(rows):
-            spike = countdown == 0 and rng.random() < 0.004
-            if spike:
-                countdown = lead
-            elif countdown > 0:
-                countdown -= 1
-                if countdown == 0:
-                    drift = 0.0025
-            drift *= 0.93
-            open_ = price
-            price = max(price * (1 + rng.normal(drift, 0.003)), 1e-3)
-            high = max(open_, price) * (1 + abs(rng.normal(0, 0.002)))
-            low = min(open_, price) * (1 - abs(rng.normal(0, 0.002)))
-            volume = rng.lognormal(10, 0.4) * (6.0 if spike else 1.0)
-            writer.writerow([f"2024-01-01T{i // 3600 % 24:02d}:{i // 60 % 60:02d}:{i % 60:02d}",
-                             f"{open_:.4f}", f"{high:.4f}", f"{low:.4f}", f"{price:.4f}", f"{volume:.1f}"])
+        for day in range(days):
+            drift, countdown = 0.0, 0                        # each session starts flat
+            start = session_start + dt.timedelta(days=day)
+            for bar in range(bars_per_day):
+                spike = countdown == 0 and rng.random() < 0.004
+                if spike:
+                    countdown = lead
+                elif countdown > 0:
+                    countdown -= 1
+                    if countdown == 0:
+                        drift = 0.0025
+                drift *= 0.93
+                open_ = price
+                price = max(price * (1 + rng.normal(drift, 0.003)), 1e-3)
+                high = max(open_, price) * (1 + abs(rng.normal(0, 0.002)))
+                low = min(open_, price) * (1 - abs(rng.normal(0, 0.002)))
+                volume = rng.lognormal(10, 0.4) * (6.0 if spike else 1.0)
+                writer.writerow([(start + dt.timedelta(minutes=bar)).isoformat(),
+                                 f"{open_:.4f}", f"{high:.4f}", f"{low:.4f}", f"{price:.4f}", f"{volume:.1f}"])
     return path
 
 
@@ -224,7 +281,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", help="timestamp,open,high,low,close,volume (default: generate synthetic data)")
     parser.add_argument("--window", type=int, default=64, help="rows of history the CNN sees")
-    parser.add_argument("--horizon", type=int, default=20, help="rows ahead the 2%% move must happen in")
+    parser.add_argument("--horizon", type=int, default=20,
+                        help="rows ahead the 2%% move must happen in, capped at the end of the calendar day")
     parser.add_argument("--target", type=float, default=0.02, help="the move to predict, as a fraction")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -238,10 +296,18 @@ def main():
     if not args.csv:
         print(f"no --csv given, generated synthetic data at {path}")
 
-    _, prices = read_csv(path)
-    features, labels = features_and_labels(prices, args.horizon, args.target)
+    timestamps, prices = read_csv(path)
+    days, time_of_day = calendar_columns(timestamps)
+    unique_days, bars_per_day = np.unique(days, return_counts=True)
+    print(f"{len(prices)} rows over {len(unique_days)} calendar days, "
+          f"median {int(np.median(bars_per_day))} bars per day")
+
+    features, labels = features_and_labels(prices, days, time_of_day, args.horizon, args.target)
     x, y, _ = windows(features, labels, args.window)
     print(f"{len(x)} windows of shape {x.shape[1:]}, {y.mean():.2%} of them positive")
+    if y.sum() == 0:
+        raise SystemExit("no positive examples: with one bar per day (or coarser) the same-day "
+                         "constraint can never be met, so the label is always 0")
 
     splits, mean, std = normalise(chronological_split(x, y, args.window, args.horizon))
     for name, (split_x, split_y) in zip(("train", "validation", "test"), splits):
