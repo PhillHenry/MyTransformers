@@ -265,29 +265,41 @@ def evaluate(model, x, y, device, thresholds=(0.3, 0.5, 0.7)):
     return report, probabilities
 
 
-def write_hits(path: str, datasets, origins, labels, probabilities, threshold: float, margin: int):
-    """Write every test window the model got right, with `margin` rows of context either side.
+def write_hits(path: str, datasets, origins, labels, probabilities, top: int, margin: int):
+    """Write the `top` most confident test windows the model got right, with `margin` rows of
+    context either side.
 
-    A hit is a window the model scored at or above `threshold` whose label really was 1 --
-    a true positive. What gets written is the bar the window ended on, which is the bar the
-    prediction was made from, surrounded by the rows before and after it so the move the
-    model spotted can be read off the file.
+    A hit is a window whose label really was 1 -- a true positive -- and hits are taken in
+    order of the model's probability. What gets written is the bar the window ended on, which
+    is the bar the prediction was made from, surrounded by the rows before and after it so the
+    move the model spotted can be read off the file.
 
-    Context is clipped at the ends of its own file and nowhere else, so two hits close
-    together will repeat rows; the `hit` column keeps the groups apart.
+    Neighbouring bars tend to score alike, so the best hits cluster around the same move. A
+    hit whose context would overlap one already chosen from the same file is skipped, which
+    keeps every row in the output to a single group and spreads the `top` over distinct moves.
     """
-    hits = np.flatnonzero((probabilities >= threshold) & (labels == 1))
+    candidates = np.flatnonzero(labels == 1)
+    candidates = candidates[np.argsort(-probabilities[candidates], kind="stable")]
+    chosen = []
+    for index in candidates:
+        if len(chosen) == top:
+            break
+        file_index, row = origins[index]
+        if all(other_file != file_index or abs(other_row - row) > 2 * margin
+               for other_file, other_row in (origins[c] for c in chosen)):
+            chosen.append(index)
+
     with open(path, "w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["hit", "source", "offset", "probability",
                          "timestamp", "open", "high", "low", "close", "volume"])
-        for hit, index in enumerate(hits):
+        for hit, index in enumerate(chosen):
             file_index, row = origins[index]
             dataset = datasets[file_index]
             for context in range(max(row - margin, 0), min(row + margin + 1, len(dataset.prices))):
                 writer.writerow([hit, dataset.path, context - row, f"{probabilities[index]:.6f}",
                                  dataset.timestamps[context].isoformat(), *dataset.prices[context]])
-    return len(hits)
+    return len(chosen)
 
 
 def train(model, train_split, validation_split, device, epochs: int, batch_size: int, learning_rate: float):
@@ -376,6 +388,8 @@ def main():
     parser.add_argument("--thresholds", default="0.3,0.5,0.7",
                         help="comma-separated probabilities at which to report precision/recall on the test set")
     parser.add_argument("--hits", help="write the correctly predicted test rows here, as CSV")
+    parser.add_argument("--top", type=int, default=10,
+                        help="how many of the most confident, non-overlapping correct predictions --hits writes")
 
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save", help="where to write the trained weights and normalisation statistics")
@@ -430,12 +444,10 @@ def main():
               f"precision {scores['precision']:.2%}, recall {scores['recall']:.2%}, F1 {scores['f1']:.3f}")
 
     if args.hits:
-        # The most selective threshold asked for: the model's most confident calls are the
-        # ones worth looking at row by row.
-        threshold = max(thresholds)
+        # The model's most confident calls are the ones worth looking at row by row.
         written = write_hits(args.hits, datasets, origins[2], splits[2][1], probabilities,
-                             threshold, args.horizon)
-        print(f"wrote {written} correct predictions at p>={threshold} "
+                             args.top, args.horizon)
+        print(f"wrote the top {written} non-overlapping correct predictions "
               f"(with {args.horizon} rows either side) to {args.hits}")
 
     if args.save:
