@@ -321,9 +321,18 @@ def main():
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--thresholds", default="0.3,0.5,0.7",
+                        help="comma-separated probabilities at which to report precision/recall on the test set")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save", help="where to write the trained weights and normalisation statistics")
     args = parser.parse_args()
+
+    try:
+        thresholds = sorted(float(t) for t in args.thresholds.split(",") if t.strip())
+    except ValueError:
+        parser.error(f"--thresholds wants numbers, got {args.thresholds!r}")
+    if not thresholds:
+        parser.error("--thresholds needs at least one value")
 
     torch.manual_seed(args.seed)
     if args.csv:
@@ -359,7 +368,7 @@ def main():
     model = StockCnn(in_channels=splits[0][0].shape[1]).to(device)
     train(model, splits[0], splits[1], device, args.epochs, args.batch_size, args.learning_rate)
 
-    report, _ = evaluate(model, *splits[2], device)
+    report, _ = evaluate(model, *splits[2], device, thresholds)
     print(f"\ntest AUC {report['auc']:.4f} against a base rate of {report['base_rate']:.2%}")
     for threshold, scores in report["thresholds"].items():
         print(f"  p>={threshold}: {scores['signals']:5d} signals, "
