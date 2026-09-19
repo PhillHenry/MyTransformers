@@ -5,9 +5,12 @@ grid of one subplot per swing: the close price for `margin` bars before and afte
 move, with the swing itself picked out. Handy for eyeballing whether the moves a model
 is being asked to predict look like anything at all, or just like noise.
 
-A swing here is one bar's close-to-close change. The top k are taken by size of move
-regardless of direction, and no two are allowed within `margin` bars of each other --
-otherwise one violent minute fills every subplot with the same picture.
+A swing here is one bar's close-to-close change *within a single calendar day*. The
+move across an overnight gap is ignored: it is usually the largest change in the file
+and has nothing to do with the intraday behaviour being looked for. The context drawn
+either side is clipped to the same day for the same reason. The top k are taken by size
+of move regardless of direction, and no two are allowed within `margin` bars of each
+other -- otherwise one violent minute fills every subplot with the same picture.
 
     python StockSwings.py --csv prices.csv --top-k 9 --margin 30
     python StockSwings.py --csv prices.csv --top-k 4 --margin 120 --out swings.png
@@ -21,7 +24,7 @@ from typing import NamedTuple
 import matplotlib
 import numpy as np
 
-from StockCnn import read_csv, synthetic_csv
+from StockCnn import calendar_columns, read_csv, synthetic_csv
 
 
 class Swing(NamedTuple):
@@ -29,7 +32,6 @@ class Swing(NamedTuple):
     index: int                                               # row the move ends on
     change: float                                            # fraction, signed
     timestamp: dt.datetime
-    overnight: bool                                          # the move spans a calendar day
 
 
 class StockSwings:
@@ -38,13 +40,22 @@ class StockSwings:
     def __init__(self, timestamps, closes):
         self.timestamps = list(timestamps)
         self.closes = np.asarray(closes, dtype=np.float64)
+        self.days, _ = calendar_columns(self.timestamps)     # also settles any mixed time zones
         # Change into row i from row i-1, so index 0 has no change to speak of.
         self.changes = np.concatenate([[0.0], np.diff(self.closes) / self.closes[:-1]])
+        # Row i's change only counts when row i-1 is the same day: an overnight gap is
+        # not a swing, it is the market reopening somewhere else.
+        self.same_day = np.concatenate([[False], self.days[1:] == self.days[:-1]])
 
     @classmethod
     def from_csv(cls, path: str):
         timestamps, prices = read_csv(path)
         return cls(timestamps, prices[:, 3])                 # close is the fourth column
+
+    def day_bounds(self, index: int):
+        """First and last-plus-one row of the calendar day that row `index` belongs to."""
+        day = self.days[index]                               # rows are sorted, so the day is contiguous
+        return int(np.searchsorted(self.days, day, "left")), int(np.searchsorted(self.days, day, "right"))
 
     def top(self, k: int, margin: int):
         """The k largest moves by magnitude, none within `margin` bars of a bigger one.
@@ -54,14 +65,12 @@ class StockSwings:
         would show the same stretch of the series.
         """
         swings, taken = [], []
-        for index in np.argsort(-np.abs(self.changes)):
-            if index == 0 or self.changes[index] == 0.0:
+        for index in np.argsort(-np.abs(np.where(self.same_day, self.changes, 0.0))):
+            if not self.same_day[index] or self.changes[index] == 0.0:
                 continue
             if any(abs(index - other) <= margin for other in taken):
                 continue
-            before, after = self.timestamps[index - 1], self.timestamps[index]
-            swings.append(Swing(int(index), float(self.changes[index]), after,
-                                before.date() != after.date()))
+            swings.append(Swing(int(index), float(self.changes[index]), self.timestamps[index]))
             taken.append(index)
             if len(swings) == k:
                 break
@@ -73,14 +82,18 @@ class StockSwings:
 
         swings = self.top(k, margin)
         if not swings:
-            raise SystemExit("no price movement to plot")
+            raise SystemExit("nothing to plot: no two consecutive rows share a calendar day "
+                             "and move the close" if not self.same_day.any() else
+                             "nothing to plot: the close never moves within a day")
         columns = min(3, len(swings))
         rows = -(-len(swings) // columns)                    # ceiling division
         figure, axes = plt.subplots(rows, columns, figsize=(5.5 * columns, 3.6 * rows), squeeze=False)
 
         for axis, swing in zip(axes.flat, swings):
-            start = max(swing.index - margin, 0)
-            stop = min(swing.index + margin + 1, len(self.closes))
+            # Context stops at the day's edges, so no subplot shows an overnight jump.
+            day_start, day_stop = self.day_bounds(swing.index)
+            start = max(swing.index - margin, day_start)
+            stop = min(swing.index + margin + 1, day_stop)
             window = self.closes[start:stop]
             # Bars are numbered relative to the swing, so every subplot is centred on 0
             # even where the file runs out before the margin does.
@@ -90,15 +103,14 @@ class StockSwings:
             axis.plot([-1, 0], self.closes[swing.index - 1:swing.index + 1],
                       color="#c0392b" if swing.change < 0 else "#1e8449", linewidth=2.4)
             axis.axvline(0, color="#999999", linewidth=0.8, linestyle="--", zorder=0)
-            axis.set_title(f"{swing.change:+.2%} at {swing.timestamp:%Y-%m-%d %H:%M}"
-                           f"{' (overnight)' if swing.overnight else ''}", fontsize=10)
+            axis.set_title(f"{swing.change:+.2%} at {swing.timestamp:%Y-%m-%d %H:%M}", fontsize=10)
             axis.set_xlabel("bars from the swing")
             axis.set_ylabel("close")
             axis.grid(alpha=0.25, linewidth=0.5)
 
         for axis in axes.flat[len(swings):]:                 # a partly filled last row
             axis.axis("off")
-        figure.suptitle(f"top {len(swings)} close-to-close swings, {margin} bars either side")
+        figure.suptitle(f"top {len(swings)} same-day close-to-close swings, up to {margin} bars either side")
         figure.tight_layout()
 
         if out:
@@ -130,10 +142,11 @@ def main():
         print(f"no --csv given, generated synthetic data at {path}")
 
     swings = StockSwings.from_csv(path)
-    print(f"{len(swings.closes)} rows, median absolute move {np.median(np.abs(swings.changes[1:])):.3%}")
+    within_day = np.abs(swings.changes[swings.same_day])
+    print(f"{len(swings.closes)} rows over {len(np.unique(swings.days))} calendar days, "
+          f"median absolute same-day move {np.median(within_day) if within_day.size else float('nan'):.3%}")
     for swing in swings.plot(args.top_k, args.margin, args.out):
-        print(f"  {swing.timestamp:%Y-%m-%d %H:%M}  {swing.change:+.2%}  row {swing.index}"
-              f"{'  overnight' if swing.overnight else ''}")
+        print(f"  {swing.timestamp:%Y-%m-%d %H:%M}  {swing.change:+.2%}  row {swing.index}")
 
 
 if __name__ == "__main__":
