@@ -11,6 +11,11 @@ Run without arguments for a synthetic random-walk demo:
     python StockCnn.py
 Or against real data:
     python StockCnn.py --csv prices.csv
+Several files train (and are evaluated as) one model -- the features are scale-free, so
+bars from different instruments are comparable:
+    python StockCnn.py --csv aapl.csv,msft.csv,nvda.csv
+Or a real example:
+    python StockCnn.py --csv /home/henryp/Downloads/aapl_dataset_London-Strategic-Edge.csv --target 0.02 --horizon 60
 """
 import argparse
 import csv
@@ -119,8 +124,23 @@ def windows(features, labels, window: int):
     """
     last_valid = np.flatnonzero(~np.isnan(labels))
     ends = last_valid[last_valid >= window - 1]
+    if ends.size == 0:                                       # a file shorter than one window
+        return np.empty((0, features.shape[1], window), dtype=features.dtype), labels[ends], ends
     x = np.stack([features[end - window + 1:end + 1].T for end in ends])
     return x, labels[ends], ends
+
+
+def dataset_from_csv(path: str, window: int, horizon: int, target: float):
+    """One file's windows and labels, plus a line describing what was in it."""
+    timestamps, prices = read_csv(path)
+    days, time_of_day = calendar_columns(timestamps)
+    unique_days, bars_per_day = np.unique(days, return_counts=True)
+    features, labels = features_and_labels(prices, days, time_of_day, horizon, target)
+    x, y, _ = windows(features, labels, window)
+    positive = y.mean() if len(y) else float("nan")
+    return x, y, (f"{len(prices)} rows over {len(unique_days)} calendar days, "
+                  f"median {int(np.median(bars_per_day))} bars per day, "
+                  f"{len(x)} windows, {positive:.2%} positive")
 
 
 def chronological_split(x, y, window: int, horizon: int, fractions=(0.7, 0.15)):
@@ -137,6 +157,18 @@ def chronological_split(x, y, window: int, horizon: int, fractions=(0.7, 0.15)):
               slice(train_end + gap, val_end),
               slice(val_end + gap, n)]
     return [(x[s], y[s]) for s in slices]
+
+
+def combined_splits(datasets, window: int, horizon: int):
+    """Split each file in time order, then concatenate the like-named parts.
+
+    Splitting per file rather than concatenating the files first keeps every file
+    represented in every split, and stops a window -- or a label's look-ahead -- from
+    reaching across a boundary into an unrelated instrument's bars.
+    """
+    per_file = [chronological_split(x, y, window, horizon) for x, y in datasets]
+    return [(np.concatenate([splits[part][0] for splits in per_file]),
+             np.concatenate([splits[part][1] for splits in per_file])) for part in range(3)]
 
 
 def normalise(splits):
@@ -279,7 +311,9 @@ def synthetic_csv(path: str, days: int = 52, bars_per_day: int = 390, seed: int 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--csv", help="timestamp,open,high,low,close,volume (default: generate synthetic data)")
+    parser.add_argument("--csv", help="comma-separated timestamp,open,high,low,close,volume files, "
+                                      "all trained and evaluated as one model "
+                                      "(default: generate synthetic data)")
     parser.add_argument("--window", type=int, default=64, help="rows of history the CNN sees")
     parser.add_argument("--horizon", type=int, default=20,
                         help="rows ahead the 2%% move must happen in, capped at the end of the calendar day")
@@ -292,29 +326,37 @@ def main():
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    path = args.csv or synthetic_csv("/tmp/synthetic_prices.csv")
-    if not args.csv:
-        print(f"no --csv given, generated synthetic data at {path}")
+    if args.csv:
+        paths = [path.strip() for path in args.csv.split(",") if path.strip()]
+    else:
+        paths = [synthetic_csv("/tmp/synthetic_prices.csv")]
+        print(f"no --csv given, generated synthetic data at {paths[0]}")
 
-    timestamps, prices = read_csv(path)
-    days, time_of_day = calendar_columns(timestamps)
-    unique_days, bars_per_day = np.unique(days, return_counts=True)
-    print(f"{len(prices)} rows over {len(unique_days)} calendar days, "
-          f"median {int(np.median(bars_per_day))} bars per day")
+    datasets = []
+    for path in paths:
+        x, y, summary = dataset_from_csv(path, args.window, args.horizon, args.target)
+        print(f"{path}: {summary}")
+        if len(x) == 0:
+            print(f"  skipped: fewer than {args.window} usable rows")
+            continue
+        datasets.append((x, y))
+    if not datasets:
+        raise SystemExit("none of the files held a full window of labelled rows")
 
-    features, labels = features_and_labels(prices, days, time_of_day, args.horizon, args.target)
-    x, y, _ = windows(features, labels, args.window)
-    print(f"{len(x)} windows of shape {x.shape[1:]}, {y.mean():.2%} of them positive")
-    if y.sum() == 0:
+    positives = sum(float(y.sum()) for _, y in datasets)
+    total = sum(len(y) for _, y in datasets)
+    print(f"{total} windows of shape {datasets[0][0].shape[1:]} from {len(datasets)} "
+          f"file{'s' if len(datasets) > 1 else ''}, {positives / total:.2%} of them positive")
+    if positives == 0:
         raise SystemExit("no positive examples: with one bar per day (or coarser) the same-day "
                          "constraint can never be met, so the label is always 0")
 
-    splits, mean, std = normalise(chronological_split(x, y, args.window, args.horizon))
+    splits, mean, std = normalise(combined_splits(datasets, args.window, args.horizon))
     for name, (split_x, split_y) in zip(("train", "validation", "test"), splits):
         print(f"{name:10s} {len(split_x):6d} windows, {split_y.mean():.2%} positive")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = StockCnn(in_channels=x.shape[1]).to(device)
+    model = StockCnn(in_channels=splits[0][0].shape[1]).to(device)
     train(model, splits[0], splits[1], device, args.epochs, args.batch_size, args.learning_rate)
 
     report, _ = evaluate(model, *splits[2], device)
@@ -326,7 +368,7 @@ def main():
     if args.save:
         torch.save({"state_dict": model.state_dict(), "mean": mean, "std": std,
                     "window": args.window, "horizon": args.horizon, "target": args.target,
-                    "features": FEATURE_NAMES}, args.save)
+                    "features": FEATURE_NAMES, "sources": paths}, args.save)
         print(f"saved to {args.save}")
 
 
