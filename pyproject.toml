@@ -12,6 +12,7 @@ dependencies = [
     "protobuf",
     "pandas",
     "pyarrow",
+    "matplotlib>=3.11.2",
 ]
 
 [tool.uv]
