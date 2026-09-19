@@ -21,6 +21,7 @@ import argparse
 import csv
 import datetime as dt
 import math
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -130,17 +131,30 @@ def windows(features, labels, window: int):
     return x, labels[ends], ends
 
 
+class Dataset(NamedTuple):
+    """One file's windows, and enough of the file to point a window back at its rows."""
+    path: str
+    x: np.ndarray
+    y: np.ndarray
+    rows: np.ndarray                                         # the price row each window ends on
+    timestamps: list
+    prices: np.ndarray
+
+
 def dataset_from_csv(path: str, window: int, horizon: int, target: float):
-    """One file's windows and labels, plus a line describing what was in it."""
+    """One file's dataset, plus a line describing what was in it."""
     timestamps, prices = read_csv(path)
     days, time_of_day = calendar_columns(timestamps)
     unique_days, bars_per_day = np.unique(days, return_counts=True)
     features, labels = features_and_labels(prices, days, time_of_day, horizon, target)
-    x, y, _ = windows(features, labels, window)
+    x, y, ends = windows(features, labels, window)
+    # Features start at row 1 -- row 0 has no previous bar to take a return from -- so a
+    # window ending at feature `end` is a window ending at price row `end + 1`.
+    dataset = Dataset(path, x, y, ends + 1, timestamps, prices)
     positive = y.mean() if len(y) else float("nan")
-    return x, y, (f"{len(prices)} rows over {len(unique_days)} calendar days, "
-                  f"median {int(np.median(bars_per_day))} bars per day, "
-                  f"{len(x)} windows, {positive:.2%} positive")
+    return dataset, (f"{len(prices)} rows over {len(unique_days)} calendar days, "
+                     f"median {int(np.median(bars_per_day))} bars per day, "
+                     f"{len(x)} windows, {positive:.2%} positive")
 
 
 def chronological_split(x, y, window: int, horizon: int, fractions=(0.7, 0.15)):
@@ -149,14 +163,17 @@ def chronological_split(x, y, window: int, horizon: int, fractions=(0.7, 0.15)):
     Shuffling would leak: overlapping windows share rows, and a label peeks `horizon`
     rows into the future. The embargo of window + horizon samples removes both.
     """
-    n = len(x)
+    return [(x[s], y[s]) for s in split_slices(len(x), window, horizon, fractions)]
+
+
+def split_slices(n: int, window: int, horizon: int, fractions=(0.7, 0.15)):
+    """Where the three splits fall, so labels and their provenance can be cut the same way."""
     train_end = int(n * fractions[0])
     val_end = int(n * (fractions[0] + fractions[1]))
     gap = window + horizon
-    slices = [slice(0, train_end),
-              slice(train_end + gap, val_end),
-              slice(val_end + gap, n)]
-    return [(x[s], y[s]) for s in slices]
+    return [slice(0, train_end),
+            slice(train_end + gap, val_end),
+            slice(val_end + gap, n)]
 
 
 def combined_splits(datasets, window: int, horizon: int):
@@ -165,10 +182,20 @@ def combined_splits(datasets, window: int, horizon: int):
     Splitting per file rather than concatenating the files first keeps every file
     represented in every split, and stops a window -- or a label's look-ahead -- from
     reaching across a boundary into an unrelated instrument's bars.
+
+    Alongside each split come its origins: the file and price row every window ended on,
+    cut by the same slices, which is what lets a prediction be traced back to the bars
+    that produced it.
     """
-    per_file = [chronological_split(x, y, window, horizon) for x, y in datasets]
-    return [(np.concatenate([splits[part][0] for splits in per_file]),
-             np.concatenate([splits[part][1] for splits in per_file])) for part in range(3)]
+    parts, origins = [[] for _ in range(3)], [[] for _ in range(3)]
+    for file_index, dataset in enumerate(datasets):
+        for part, piece in enumerate(split_slices(len(dataset.x), window, horizon)):
+            rows = dataset.rows[piece]
+            parts[part].append((dataset.x[piece], dataset.y[piece]))
+            origins[part].append(np.stack([np.full(len(rows), file_index, dtype=np.int64), rows], axis=1))
+    splits = [(np.concatenate([x for x, _ in group]), np.concatenate([y for _, y in group]))
+              for group in parts]
+    return splits, [np.concatenate(group) for group in origins]
 
 
 def normalise(splits):
@@ -236,6 +263,31 @@ def evaluate(model, x, y, device, thresholds=(0.3, 0.5, 0.7)):
         report["thresholds"][threshold] = {"precision": precision, "recall": recall, "f1": f1,
                                            "signals": int(predicted.sum())}
     return report, probabilities
+
+
+def write_hits(path: str, datasets, origins, labels, probabilities, threshold: float, margin: int):
+    """Write every test window the model got right, with `margin` rows of context either side.
+
+    A hit is a window the model scored at or above `threshold` whose label really was 1 --
+    a true positive. What gets written is the bar the window ended on, which is the bar the
+    prediction was made from, surrounded by the rows before and after it so the move the
+    model spotted can be read off the file.
+
+    Context is clipped at the ends of its own file and nowhere else, so two hits close
+    together will repeat rows; the `hit` column keeps the groups apart.
+    """
+    hits = np.flatnonzero((probabilities >= threshold) & (labels == 1))
+    with open(path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["hit", "source", "offset", "probability",
+                         "timestamp", "open", "high", "low", "close", "volume"])
+        for hit, index in enumerate(hits):
+            file_index, row = origins[index]
+            dataset = datasets[file_index]
+            for context in range(max(row - margin, 0), min(row + margin + 1, len(dataset.prices))):
+                writer.writerow([hit, dataset.path, context - row, f"{probabilities[index]:.6f}",
+                                 dataset.timestamps[context].isoformat(), *dataset.prices[context]])
+    return len(hits)
 
 
 def train(model, train_split, validation_split, device, epochs: int, batch_size: int, learning_rate: float):
@@ -323,6 +375,9 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--thresholds", default="0.3,0.5,0.7",
                         help="comma-separated probabilities at which to report precision/recall on the test set")
+    parser.add_argument("--hits", help="write the correctly predicted test rows here, as CSV")
+    parser.add_argument("--hits-margin", type=int, default=20,
+                        help="rows of context written either side of each correct prediction")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save", help="where to write the trained weights and normalisation statistics")
     args = parser.parse_args()
@@ -333,6 +388,8 @@ def main():
         parser.error(f"--thresholds wants numbers, got {args.thresholds!r}")
     if not thresholds:
         parser.error("--thresholds needs at least one value")
+    if args.hits_margin < 0:
+        parser.error("--hits-margin cannot be negative")
 
     torch.manual_seed(args.seed)
     if args.csv:
@@ -343,24 +400,25 @@ def main():
 
     datasets = []
     for path in paths:
-        x, y, summary = dataset_from_csv(path, args.window, args.horizon, args.target)
+        dataset, summary = dataset_from_csv(path, args.window, args.horizon, args.target)
         print(f"{path}: {summary}")
-        if len(x) == 0:
+        if len(dataset.x) == 0:
             print(f"  skipped: fewer than {args.window} usable rows")
             continue
-        datasets.append((x, y))
+        datasets.append(dataset)
     if not datasets:
         raise SystemExit("none of the files held a full window of labelled rows")
 
-    positives = sum(float(y.sum()) for _, y in datasets)
-    total = sum(len(y) for _, y in datasets)
-    print(f"{total} windows of shape {datasets[0][0].shape[1:]} from {len(datasets)} "
+    positives = sum(float(dataset.y.sum()) for dataset in datasets)
+    total = sum(len(dataset.y) for dataset in datasets)
+    print(f"{total} windows of shape {datasets[0].x.shape[1:]} from {len(datasets)} "
           f"file{'s' if len(datasets) > 1 else ''}, {positives / total:.2%} of them positive")
     if positives == 0:
         raise SystemExit("no positive examples: with one bar per day (or coarser) the same-day "
                          "constraint can never be met, so the label is always 0")
 
-    splits, mean, std = normalise(combined_splits(datasets, args.window, args.horizon))
+    splits, origins = combined_splits(datasets, args.window, args.horizon)
+    splits, mean, std = normalise(splits)
     for name, (split_x, split_y) in zip(("train", "validation", "test"), splits):
         print(f"{name:10s} {len(split_x):6d} windows, {split_y.mean():.2%} positive")
 
@@ -368,11 +426,20 @@ def main():
     model = StockCnn(in_channels=splits[0][0].shape[1]).to(device)
     train(model, splits[0], splits[1], device, args.epochs, args.batch_size, args.learning_rate)
 
-    report, _ = evaluate(model, *splits[2], device, thresholds)
+    report, probabilities = evaluate(model, *splits[2], device, thresholds)
     print(f"\ntest AUC {report['auc']:.4f} against a base rate of {report['base_rate']:.2%}")
     for threshold, scores in report["thresholds"].items():
         print(f"  p>={threshold}: {scores['signals']:5d} signals, "
               f"precision {scores['precision']:.2%}, recall {scores['recall']:.2%}, F1 {scores['f1']:.3f}")
+
+    if args.hits:
+        # The most selective threshold asked for: the model's most confident calls are the
+        # ones worth looking at row by row.
+        threshold = max(thresholds)
+        written = write_hits(args.hits, datasets, origins[2], splits[2][1], probabilities,
+                             threshold, args.hits_margin)
+        print(f"wrote {written} correct predictions at p>={threshold} "
+              f"(with {args.hits_margin} rows either side) to {args.hits}")
 
     if args.save:
         torch.save({"state_dict": model.state_dict(), "mean": mean, "std": std,
