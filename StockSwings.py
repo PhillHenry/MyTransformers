@@ -27,6 +27,18 @@ import numpy as np
 from StockCnn import calendar_columns, read_csv, synthetic_csv
 
 
+def interactive_backend() -> bool:
+    """Whether matplotlib ended up with a backend that can actually open a window.
+
+    It falls back to Agg without complaint when no GUI toolkit will import, and only
+    says so as a warning once a figure is shown.
+    """
+    from matplotlib.backends import BackendFilter, backend_registry
+    import matplotlib.pyplot as plt
+
+    return plt.get_backend().lower() in backend_registry.list_builtin(BackendFilter.INTERACTIVE)
+
+
 class Swing(NamedTuple):
     """One close-to-close move: where it happened, how big it was, and when."""
     index: int                                               # row the move ends on
@@ -113,6 +125,11 @@ class StockSwings:
         figure.suptitle(f"top {len(swings)} same-day close-to-close swings, up to {margin} bars either side")
         figure.tight_layout()
 
+        if out is None and not interactive_backend():
+            # Nothing can open a window here -- plt.show() would warn and draw nothing --
+            # so write the figure out rather than exiting with an empty screen.
+            out = "swings.png"
+            print(f"the {plt.get_backend()} backend cannot open a window, so the figure goes to a file")
         if out:
             figure.savefig(out, dpi=140)
             print(f"saved to {out}")
@@ -127,7 +144,8 @@ def main():
     parser.add_argument("--csv", help="timestamp,open,high,low,close,volume (default: generate synthetic data)")
     parser.add_argument("--top-k", type=int, default=9, help="how many swings to plot")
     parser.add_argument("--margin", type=int, default=30, help="bars of context drawn either side of each swing")
-    parser.add_argument("--out", help="write the figure here instead of opening a window")
+    parser.add_argument("--out", help="write the figure here instead of opening a window "
+                                      "(the default when no GUI backend is available)")
     args = parser.parse_args()
 
     if args.top_k < 1:
