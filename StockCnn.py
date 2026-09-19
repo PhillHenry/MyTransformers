@@ -376,8 +376,7 @@ def main():
     parser.add_argument("--thresholds", default="0.3,0.5,0.7",
                         help="comma-separated probabilities at which to report precision/recall on the test set")
     parser.add_argument("--hits", help="write the correctly predicted test rows here, as CSV")
-    parser.add_argument("--hits-margin", type=int, default=20,
-                        help="rows of context written either side of each correct prediction")
+
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save", help="where to write the trained weights and normalisation statistics")
     args = parser.parse_args()
@@ -388,8 +387,6 @@ def main():
         parser.error(f"--thresholds wants numbers, got {args.thresholds!r}")
     if not thresholds:
         parser.error("--thresholds needs at least one value")
-    if args.hits_margin < 0:
-        parser.error("--hits-margin cannot be negative")
 
     torch.manual_seed(args.seed)
     if args.csv:
@@ -437,9 +434,9 @@ def main():
         # ones worth looking at row by row.
         threshold = max(thresholds)
         written = write_hits(args.hits, datasets, origins[2], splits[2][1], probabilities,
-                             threshold, args.hits_margin)
+                             threshold, args.horizon)
         print(f"wrote {written} correct predictions at p>={threshold} "
-              f"(with {args.hits_margin} rows either side) to {args.hits}")
+              f"(with {args.horizon} rows either side) to {args.hits}")
 
     if args.save:
         torch.save({"state_dict": model.state_dict(), "mean": mean, "std": std,
