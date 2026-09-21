@@ -4,6 +4,10 @@ Reads a CSV of `timestamp,open,high,low,close,volume`, turns it into overlapping
 windows of scale-free features, and trains a convolutional classifier on the binary
 label "did the high reach close * 1.02 within the next H rows *and* before midnight?".
 
+Only bars timestamped between 13:35 and 19:55 UTC inclusive are used; anything outside
+that window is dropped as the file is read, so it contributes to neither features nor
+labels.
+
 The same-calendar-day constraint means the effective horizon shrinks as the session
 runs down, so the timestamp itself becomes predictive and is fed in as a feature.
 
@@ -31,6 +35,12 @@ from torch import nn
 FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close", "log_volume_change",
                  "time_of_day", "bars_elapsed_today"]
 
+# The only bars the model ever sees, inclusive of both ends. Everything outside is
+# dropped as it is read, so the session boundaries look to the rest of the code exactly
+# like the start and end of a day's file.
+SESSION_START = dt.time(13, 35)
+SESSION_END = dt.time(19, 55)
+
 
 def parse_timestamp(raw: str) -> dt.datetime:
     """ISO-8601 (with or without a `T`, `Z` or offset) or an epoch number in seconds/millis."""
@@ -43,18 +53,30 @@ def parse_timestamp(raw: str) -> dt.datetime:
     return dt.datetime.fromtimestamp(number / 1000.0 if number > 1e11 else number, tz=dt.timezone.utc)
 
 
+def in_session(timestamp: dt.datetime) -> bool:
+    """Does this bar fall inside the 13:35-19:55 UTC window?
+
+    Offset-aware stamps are converted; naive ones are taken to be UTC already, since
+    there is nothing else to go on.
+    """
+    utc = timestamp.astimezone(dt.timezone.utc) if timestamp.tzinfo is not None else timestamp
+    return SESSION_START <= utc.time() <= SESSION_END
+
+
 def read_csv(path: str):
-    """Rows sorted by timestamp: the parsed timestamps and the OHLCV columns as floats.
+    """The session's rows, sorted by timestamp: parsed timestamps and OHLCV columns as floats.
 
     The timestamps are no longer just for ordering — the calendar day decides where
-    each label's look-ahead window is cut off.
+    each label's look-ahead window is cut off — and bars outside 13:35-19:55 UTC are
+    discarded here, so no feature or label is ever computed from one.
     """
     with open(path, newline="") as handle:
         rows = list(csv.DictReader(handle))
-    timestamps = sorted(parse_timestamp(row["timestamp"]) for row in rows)
-    rows.sort(key=lambda row: parse_timestamp(row["timestamp"]))
-    prices = np.array([[float(row[c]) for c in ("open", "high", "low", "close", "volume")] for row in rows],
-                      dtype=np.float64)
+    stamped = sorted(((parse_timestamp(row["timestamp"]), row) for row in rows), key=lambda pair: pair[0])
+    stamped = [pair for pair in stamped if in_session(pair[0])]
+    timestamps = [timestamp for timestamp, _ in stamped]
+    prices = np.array([[float(row[c]) for c in ("open", "high", "low", "close", "volume")]
+                       for _, row in stamped], dtype=np.float64).reshape(-1, 5)
     return timestamps, prices
 
 
@@ -153,8 +175,9 @@ def dataset_from_csv(path: str, window: int, horizon: int, target: float):
     # window ending at feature `end` is a window ending at price row `end + 1`.
     dataset = Dataset(path, x, y, ends + 1, timestamps, prices)
     positive = y.mean() if len(y) else float("nan")
-    return dataset, (f"{len(prices)} rows over {len(unique_days)} calendar days, "
-                     f"median {int(np.median(bars_per_day))} bars per day, "
+    median_bars = int(np.median(bars_per_day)) if len(bars_per_day) else 0
+    return dataset, (f"{len(prices)} rows in session over {len(unique_days)} calendar days, "
+                     f"median {median_bars} bars per day, "
                      f"{len(x)} windows, {positive:.2%} positive")
 
 
@@ -338,43 +361,6 @@ def train(model, train_split, validation_split, device, epochs: int, batch_size:
     print(f"best validation AUC {best_auc:.4f}")
     return model
 
-
-def synthetic_csv(path: str, days: int = 52, bars_per_day: int = 390, seed: int = 0):
-    """A random walk in which a volume spike precedes a burst of upward drift.
-
-    Purely to have something learnable to demo against: the signal is a spike
-    followed `lead` bars later by positive drift, which is exactly the sort of
-    local, shift-invariant pattern a CNN over a window should be able to find.
-    Bars are one minute apart from 09:30, so the calendar day actually bites.
-    """
-    rng = np.random.default_rng(seed)
-    session_start = dt.datetime(2024, 1, 1, 9, 30)
-    price, lead = 100.0, 5
-    with open(path, "w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["timestamp", "open", "high", "low", "close", "volume"])
-        for day in range(days):
-            drift, countdown = 0.0, 0                        # each session starts flat
-            start = session_start + dt.timedelta(days=day)
-            for bar in range(bars_per_day):
-                spike = countdown == 0 and rng.random() < 0.004
-                if spike:
-                    countdown = lead
-                elif countdown > 0:
-                    countdown -= 1
-                    if countdown == 0:
-                        drift = 0.0025
-                drift *= 0.93
-                open_ = price
-                price = max(price * (1 + rng.normal(drift, 0.003)), 1e-3)
-                high = max(open_, price) * (1 + abs(rng.normal(0, 0.002)))
-                low = min(open_, price) * (1 - abs(rng.normal(0, 0.002)))
-                volume = rng.lognormal(10, 0.4) * (6.0 if spike else 1.0)
-                writer.writerow([(start + dt.timedelta(minutes=bar)).isoformat(),
-                                 f"{open_:.4f}", f"{high:.4f}", f"{low:.4f}", f"{price:.4f}", f"{volume:.1f}"])
-    return path
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", help="comma-separated timestamp,open,high,low,close,volume files, "
@@ -405,22 +391,20 @@ def main():
         parser.error("--thresholds needs at least one value")
 
     torch.manual_seed(args.seed)
-    if args.csv:
-        paths = [path.strip() for path in args.csv.split(",") if path.strip()]
-    else:
-        paths = [synthetic_csv("/tmp/synthetic_prices.csv")]
-        print(f"no --csv given, generated synthetic data at {paths[0]}")
+    paths = [path.strip() for path in args.csv.split(",") if path.strip()]
 
     datasets = []
     for path in paths:
         dataset, summary = dataset_from_csv(path, args.window, args.horizon, args.target)
         print(f"{path}: {summary}")
         if len(dataset.x) == 0:
-            print(f"  skipped: fewer than {args.window} usable rows")
+            print(f"  skipped: fewer than {args.window} usable rows "
+                  f"between {SESSION_START:%H:%M} and {SESSION_END:%H:%M} UTC")
             continue
         datasets.append(dataset)
     if not datasets:
-        raise SystemExit("none of the files held a full window of labelled rows")
+        raise SystemExit(f"none of the files held a full window of labelled rows between "
+                         f"{SESSION_START:%H:%M} and {SESSION_END:%H:%M} UTC")
 
     positives = sum(float(dataset.y.sum()) for dataset in datasets)
     total = sum(len(dataset.y) for dataset in datasets)

@@ -24,7 +24,7 @@ from typing import NamedTuple
 import matplotlib
 import numpy as np
 
-from StockCnn import calendar_columns, read_csv, synthetic_csv
+from StockCnn import calendar_columns, read_csv
 
 
 def interactive_backend() -> bool:
@@ -155,7 +155,7 @@ def main():
     if args.out:
         matplotlib.use("Agg")                                # no display needed to write a file
 
-    path = args.csv or synthetic_csv("/tmp/synthetic_prices.csv")
+    path = args.csv
     if not args.csv:
         print(f"no --csv given, generated synthetic data at {path}")
 
