@@ -21,6 +21,7 @@ import argparse
 import csv
 import datetime as dt
 import math
+import os
 from typing import NamedTuple
 
 import numpy as np
@@ -265,12 +266,13 @@ def evaluate(model, x, y, device, thresholds=(0.3, 0.5, 0.7)):
     return report, probabilities
 
 
-def write_hits(path: str, datasets, origins, labels, probabilities, top: int, margin: int):
-    """Write the `top` most confident test windows the model got right, with `margin` rows of
-    context either side.
+def write_hits(path: str, datasets, origins, labels, probabilities, top: int, margin: int, label: int = 1):
+    """Write the `top` most confident test windows whose label was `label`, with `margin` rows
+    of context either side.
 
-    A hit is a window whose label really was 1 -- a true positive -- and hits are taken in
-    order of the model's probability. What gets written is the bar the window ended on, which
+    With the default `label` of 1 a hit is a window the model got right -- a true positive.
+    With 0 it is one the model got wrong -- a false positive, the confident call on a move
+    that never came. Either way hits are taken in order of the model's probability. What gets written is the bar the window ended on, which
     is the bar the prediction was made from, surrounded by the rows before and after it so the
     move the model spotted can be read off the file.
 
@@ -278,7 +280,7 @@ def write_hits(path: str, datasets, origins, labels, probabilities, top: int, ma
     hit whose context would overlap one already chosen from the same file is skipped, which
     keeps every row in the output to a single group and spreads the `top` over distinct moves.
     """
-    candidates = np.flatnonzero(labels == 1)
+    candidates = np.flatnonzero(labels == label)
     candidates = candidates[np.argsort(-probabilities[candidates], kind="stable")]
     chosen = []
     for index in candidates:
@@ -387,9 +389,9 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--thresholds", default="0.3,0.5,0.7",
                         help="comma-separated probabilities at which to report precision/recall on the test set")
-    parser.add_argument("--hits", help="write the correctly predicted test rows here, as CSV")
+    parser.add_argument("--hits", help="write the correctly predicted test rows here, as CSV, and the most confident wrong ones alongside with _negative appended to the name")
     parser.add_argument("--top", type=int, default=10,
-                        help="how many of the most confident, non-overlapping correct predictions --hits writes")
+                        help="how many of the most confident, non-overlapping predictions --hits writes to each file")
 
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save", help="where to write the trained weights and normalisation statistics")
@@ -449,6 +451,13 @@ def main():
                              args.top, args.horizon)
         print(f"wrote the top {written} non-overlapping correct predictions "
               f"(with {args.horizon} rows either side) to {args.hits}")
+        # And the calls it was just as sure of but got wrong, for comparison.
+        stem, extension = os.path.splitext(args.hits)
+        negative_path = f"{stem}_negative{extension}"
+        written = write_hits(negative_path, datasets, origins[2], splits[2][1], probabilities,
+                             args.top, args.horizon, label=0)
+        print(f"wrote the top {written} non-overlapping wrong predictions "
+              f"(with {args.horizon} rows either side) to {negative_path}")
 
     if args.save:
         torch.save({"state_dict": model.state_dict(), "mean": mean, "std": std,
