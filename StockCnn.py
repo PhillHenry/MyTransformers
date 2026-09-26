@@ -44,10 +44,9 @@ from torch import nn
 
 FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close", "log_volume_change",
                  "time_of_day", "bars_elapsed_today"]
-DEFAULT_MOVING_AVERAGES = (50, 100)
 
 
-def feature_names(moving_averages=DEFAULT_MOVING_AVERAGES):
+def feature_names(moving_averages=()):
     """The fixed features followed by one close-versus-average channel per moving-average window."""
     return FEATURE_NAMES + [f"close_vs_ma{window}" for window in moving_averages]
 
@@ -173,7 +172,7 @@ def daily_moving_average(close, days, window: int):
 
 
 def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
-                        moving_averages=DEFAULT_MOVING_AVERAGES):
+                        moving_averages=()):
     """Per-row features plus the forward-looking label, aligned on the same index.
 
     Price features are ratios/differences so the net never sees the absolute price
@@ -279,7 +278,7 @@ class Dataset(NamedTuple):
 
 
 def dataset_from_csv(path: str, window: int, horizon: int, target: float,
-                     moving_averages=DEFAULT_MOVING_AVERAGES):
+                     moving_averages=()):
     """One file's dataset, plus a line describing what was in it."""
     timestamps, prices = read_csv(path)
     days, time_of_day = calendar_columns(timestamps)
@@ -493,9 +492,9 @@ def main():
     parser.add_argument("--horizon", type=int, default=20,
                         help="rows ahead the 2%% move must happen in, capped at the end of the calendar day")
     parser.add_argument("--target", type=float, default=0.02, help="the move to predict, as a fraction")
-    parser.add_argument("--moving-averages", default=",".join(map(str, DEFAULT_MOVING_AVERAGES)),
+    parser.add_argument("--moving-averages", default="",
                         help="comma-separated day counts; each adds close relative to the moving average "
-                             "of that many previous days' closes as a feature (empty for none). Days "
+                             "of that many previous days' closes as a feature (default: none). Days "
                              "before the longest average is available produce no samples")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=256)
