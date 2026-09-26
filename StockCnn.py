@@ -46,9 +46,11 @@ FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close",
                  "time_of_day", "bars_elapsed_today"]
 
 
-def feature_names(moving_averages=()):
-    """The fixed features followed by one close-versus-average channel per moving-average window."""
-    return FEATURE_NAMES + [f"close_vs_ma{window}" for window in moving_averages]
+def feature_names(moving_averages=(), minute_moving_averages=()):
+    """The fixed features followed by one close-versus-average channel per moving-average window,
+    the day-long averages first."""
+    return (FEATURE_NAMES + [f"close_vs_ma{window}" for window in moving_averages]
+            + [f"close_vs_ma{window}min" for window in minute_moving_averages])
 
 # The only bars the model ever sees, inclusive of both ends. Everything outside is
 # dropped as it is read, so the session boundaries look to the rest of the code exactly
@@ -171,8 +173,24 @@ def daily_moving_average(close, days, window: int):
     return averages[day_index]
 
 
+def minute_moving_average(close, days, minutes, window: int):
+    """Per row, the mean close over the last `window` minutes of the row's own day, itself included.
+
+    The span is clock time, not rows: a missing minute leaves the average over fewer
+    bars rather than stretching it further back. Rows less than `window` minutes after
+    their day's first bar get NaN -- the average would reach into yesterday, or be over
+    less time than it claims.
+    """
+    _, first_of_day, day_index = np.unique(days, return_index=True, return_inverse=True)
+    start = np.searchsorted(minutes, minutes - window + 1)
+    cumulative = np.concatenate([[0.0], np.cumsum(close)])
+    end = np.arange(1, len(close) + 1)
+    averages = (cumulative[end] - cumulative[start]) / (end - start)
+    return np.where(minutes - window + 1 >= minutes[first_of_day][day_index], averages, np.nan)
+
+
 def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
-                        moving_averages=()):
+                        moving_averages=(), minute_moving_averages=()):
     """Per-row features plus the forward-looking label, aligned on the same index.
 
     Price features are ratios/differences so the net never sees the absolute price
@@ -194,15 +212,22 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
     moving average of that many previous days' closes, as a fraction, so it too is
     scale-free. These are the one deliberate exception to staying inside a day -- a
     multi-day trend is the point of them -- but they only look back at finished days.
-    Rows too early in the file to have the longest average get no label, and so no window.
+    Rows too early in the file to have the longest average are NaN, and `windows` skips them.
+
+    Each of `minute_moving_averages` adds the same kind of channel against the mean close
+    over that many minutes of the same day. Those stay inside the day, so rows in the
+    first `window` minutes of each session are NaN too.
     """
     open_, high, low, close, volume = (prices[:, i] for i in range(5))
 
     # True where the diff below spans midnight: row i-1 is yesterday, row i is today.
     overnight = days[1:] != days[:-1]
     # Computed on every row, the first included, so row 0 can still close its day.
-    close_vs_averages = [close[1:] / daily_moving_average(close, days, n)[1:] - 1.0
-                         for n in moving_averages]
+    minutes = minute_number(days, time_of_day)
+    close_vs_averages = ([close[1:] / daily_moving_average(close, days, n)[1:] - 1.0
+                          for n in moving_averages]
+                         + [close[1:] / minute_moving_average(close, days, minutes, n)[1:] - 1.0
+                            for n in minute_moving_averages])
     days, time_of_day = days[1:], time_of_day[1:]
 
     # Zero is a placeholder, not a measurement: `windows` never lets these rows reach the
@@ -233,9 +258,6 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
             labels[i] = np.nan                               # this day may continue past the file
         else:
             labels[i] = 0.0                                  # includes bars whose day simply ran out
-    # No label where a moving average is still undefined, so `windows` never ends on such a row;
-    # a window is one day long, so none of its rows are undefined either.
-    labels[np.isnan(features).any(axis=1)] = np.nan
 
     return features.astype(np.float32), labels.astype(np.float32)
 
@@ -254,6 +276,10 @@ def windows(features, labels, days, minutes, window: int):
     The first `window` minutes of each session therefore produce no sample -- there is
     not yet enough of the day to look back over.
 
+    Nor is a window kept if any of its rows has an undefined feature -- a moving average
+    without enough history behind it. Checking only the last row isn't enough: a minute
+    average is undefined for the start of every session, which a window can reach back into.
+
     Returns X of shape [samples, features, window] — channels-first, as Conv1d wants —
     and the index of each window's last row, so splits can stay chronological.
     """
@@ -261,6 +287,8 @@ def windows(features, labels, days, minutes, window: int):
     elapsed = bars_into_day(days)
     ends = last_valid[elapsed[last_valid] >= window]
     ends = ends[minutes[ends] - minutes[ends - window + 1] == window - 1]
+    undefined = np.concatenate([[0], np.cumsum(np.isnan(features).any(axis=1))])
+    ends = ends[undefined[ends + 1] == undefined[ends - window + 1]]
     if ends.size == 0:                                       # no day long enough for one window
         return np.empty((0, features.shape[1], window), dtype=features.dtype), labels[ends], ends
     x = np.stack([features[end - window + 1:end + 1].T for end in ends])
@@ -278,12 +306,13 @@ class Dataset(NamedTuple):
 
 
 def dataset_from_csv(path: str, window: int, horizon: int, target: float,
-                     moving_averages=()):
+                     moving_averages=(), minute_moving_averages=()):
     """One file's dataset, plus a line describing what was in it."""
     timestamps, prices = read_csv(path)
     days, time_of_day = calendar_columns(timestamps)
     unique_days, bars_per_day = np.unique(days, return_counts=True)
-    features, labels = features_and_labels(prices, days, time_of_day, horizon, target, moving_averages)
+    features, labels = features_and_labels(prices, days, time_of_day, horizon, target,
+                                           moving_averages, minute_moving_averages)
     x, y, ends = windows(features, labels, days[1:], minute_number(days, time_of_day)[1:], window)
     # Features start at row 1 -- row 0 has no previous bar to take a return from -- so a
     # window ending at feature `end` is a window ending at price row `end + 1`.
@@ -481,6 +510,17 @@ def train(model, train_split, validation_split, device, epochs: int, batch_size:
     print(f"best validation AUC {best_auc:.4f}")
     return model
 
+def parse_counts(parser, flag: str, text: str):
+    """A comma-separated list of positive whole numbers, or a parser error naming `flag`."""
+    try:
+        counts = [int(n) for n in text.split(",") if n.strip()]
+    except ValueError:
+        parser.error(f"{flag} wants whole numbers, got {text!r}")
+    if any(n < 1 for n in counts):
+        parser.error(f"{flag} must all be at least 1")
+    return counts
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", help="comma-separated timestamp,open,high,low,close,volume files, "
@@ -496,6 +536,11 @@ def main():
                         help="comma-separated day counts; each adds close relative to the moving average "
                              "of that many previous days' closes as a feature (default: none). Days "
                              "before the longest average is available produce no samples")
+    parser.add_argument("--minute-moving-averages", default="",
+                        help="comma-separated minute counts; each adds close relative to the moving average "
+                             "of that many minutes of the same day's closes as a feature (default: none). "
+                             "The first minutes of each session, before the longest is available, "
+                             "produce no samples")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -515,24 +560,23 @@ def main():
         parser.error(f"--thresholds wants numbers, got {args.thresholds!r}")
     if not thresholds:
         parser.error("--thresholds needs at least one value")
-    try:
-        moving_averages = [int(n) for n in args.moving_averages.split(",") if n.strip()]
-    except ValueError:
-        parser.error(f"--moving-averages wants whole numbers, got {args.moving_averages!r}")
-    if any(n < 1 for n in moving_averages):
-        parser.error("--moving-averages must all be at least 1")
+    moving_averages = parse_counts(parser, "--moving-averages", args.moving_averages)
+    minute_moving_averages = parse_counts(parser, "--minute-moving-averages", args.minute_moving_averages)
 
     torch.manual_seed(args.seed)
     paths = [path.strip() for path in args.csv.split(",") if path.strip()]
 
     datasets = []
     for path in paths:
-        dataset, summary = dataset_from_csv(path, args.window, args.horizon, args.target, moving_averages)
+        dataset, summary = dataset_from_csv(path, args.window, args.horizon, args.target,
+                                            moving_averages, minute_moving_averages)
         print(f"{path}: {summary}")
         if len(dataset.x) == 0:
             print(f"  skipped: no {args.window} unbroken minutes of labelled rows "
                   f"between {SESSION_START:%H:%M} and {SESSION_END:%H:%M} UTC"
-                  + (f" after the first {max(moving_averages)} days" if moving_averages else ""))
+                  + (f" after the first {max(moving_averages)} days" if moving_averages else "")
+                  + (f" and {max(minute_moving_averages)} minutes of each session"
+                     if minute_moving_averages else ""))
             continue
         datasets.append(dataset)
     if not datasets:
@@ -579,7 +623,8 @@ def main():
     if args.save:
         torch.save({"state_dict": model.state_dict(), "mean": mean, "std": std,
                     "window": args.window, "horizon": args.horizon, "target": args.target,
-                    "features": feature_names(moving_averages), "moving_averages": moving_averages,
+                    "features": feature_names(moving_averages, minute_moving_averages),
+                    "moving_averages": moving_averages, "minute_moving_averages": minute_moving_averages,
                     "sources": paths}, args.save)
         print(f"saved to {args.save}")
 
