@@ -1,4 +1,4 @@
-"""Plots the windows StockCnn.py wrote with --hits: open, high, low, close and volume per hit.
+"""Plots the windows StockCnn.py or StockLstm.py wrote with --hits: open, high, low, close and volume per hit.
 
 Each group of rows sharing a `hit` value is one prediction the model got right, with its
 context either side. Every group gets its own subplot: the four prices as lines, volume
@@ -87,7 +87,7 @@ def plot(groups, out: str = None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("hits", help="comma-separated CSV files written by StockCnn.py --hits")
+    parser.add_argument("hits", help="comma-separated CSV files written by StockCnn.py or StockLstm.py --hits")
     parser.add_argument("--top", type=int, default=12, help="how many hits to plot")
     parser.add_argument("--out", help="write the figure here instead of opening a window "
                                       "(the default when no GUI backend is available)")

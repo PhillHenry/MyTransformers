@@ -24,7 +24,7 @@ from typing import NamedTuple
 import matplotlib
 import numpy as np
 
-from StockCnn import calendar_columns, read_csv
+from StockCommon import calendar_columns, read_csv
 
 
 def interactive_backend() -> bool:
