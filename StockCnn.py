@@ -40,6 +40,12 @@ from torch import nn
 
 FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close", "log_volume_change",
                  "time_of_day", "bars_elapsed_today"]
+DEFAULT_MOVING_AVERAGES = (50, 100, 200)
+
+
+def feature_names(moving_averages=DEFAULT_MOVING_AVERAGES):
+    """The fixed features followed by one close-versus-average channel per moving-average window."""
+    return FEATURE_NAMES + [f"close_vs_ma{window}" for window in moving_averages]
 
 # The only bars the model ever sees, inclusive of both ends. Everything outside is
 # dropped as it is read, so the session boundaries look to the rest of the code exactly
@@ -114,7 +120,22 @@ def bars_into_day(days):
     return np.arange(len(days)) - np.repeat(first_of_day, np.diff(np.append(first_of_day, len(days))))
 
 
-def features_and_labels(prices, days, time_of_day, horizon: int, target: float):
+def intraday_moving_average(close, days, window: int):
+    """Trailing mean of `close` over the last `window` bars *of the same day*, current bar included.
+
+    Early in a session there are fewer than `window` bars to average, so the mean is
+    taken over however many the day has had so far rather than reaching back into
+    yesterday. The bars-elapsed feature tells the model how full the average is.
+    """
+    elapsed = bars_into_day(days)
+    cumulative = np.concatenate([[0.0], np.cumsum(close)])
+    end = np.arange(1, len(close) + 1)
+    start = end - 1 - np.minimum(elapsed, window - 1)
+    return (cumulative[end] - cumulative[start]) / (end - start)
+
+
+def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
+                        moving_averages=DEFAULT_MOVING_AVERAGES):
     """Per-row features plus the forward-looking label, aligned on the same index.
 
     Price features are ratios/differences so the net never sees the absolute price
@@ -131,11 +152,15 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float):
     same calendar day as row i* trades at or above close[i] * (1 + target). Rows near
     the close therefore have fewer chances, which is why the clock is a feature: with
     no notion of time the model could only average over "how much day is left".
+
+    Each of `moving_averages` adds a channel: how far the close sits above or below its
+    intraday moving average over that many bars, as a fraction, so it too is scale-free.
     """
     open_, high, low, close, volume = (prices[:, i] for i in range(5))
 
     # True where the diff below spans midnight: row i-1 is yesterday, row i is today.
     overnight = days[1:] != days[:-1]
+    all_days = days
     days, time_of_day = days[1:], time_of_day[1:]
 
     # Zero is a placeholder, not a measurement: `windows` never lets these rows reach the
@@ -151,8 +176,12 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float):
     # samples it, which is what limits how many chances the 2% move has left.
     bars_elapsed = bars_into_day(days)
 
+    # Averaged over the full file's days, then cut to row 1 onwards like everything else.
+    close_vs_averages = [close[1:] / intraday_moving_average(close, all_days, n)[1:] - 1.0
+                         for n in moving_averages]
+
     features = np.stack([log_return, high_vs_close, low_vs_close, open_vs_close, log_volume_change,
-                         time_of_day, np.log1p(bars_elapsed)], axis=1)
+                         time_of_day, np.log1p(bars_elapsed), *close_vs_averages], axis=1)
 
     close_, high_ = close[1:], high[1:]
     n = len(close_)
@@ -201,12 +230,13 @@ class Dataset(NamedTuple):
     prices: np.ndarray
 
 
-def dataset_from_csv(path: str, window: int, horizon: int, target: float):
+def dataset_from_csv(path: str, window: int, horizon: int, target: float,
+                     moving_averages=DEFAULT_MOVING_AVERAGES):
     """One file's dataset, plus a line describing what was in it."""
     timestamps, prices = read_csv(path)
     days, time_of_day = calendar_columns(timestamps)
     unique_days, bars_per_day = np.unique(days, return_counts=True)
-    features, labels = features_and_labels(prices, days, time_of_day, horizon, target)
+    features, labels = features_and_labels(prices, days, time_of_day, horizon, target, moving_averages)
     x, y, ends = windows(features, labels, days[1:], window)
     # Features start at row 1 -- row 0 has no previous bar to take a return from -- so a
     # window ending at feature `end` is a window ending at price row `end + 1`.
@@ -413,6 +443,9 @@ def main():
     parser.add_argument("--horizon", type=int, default=20,
                         help="rows ahead the 2%% move must happen in, capped at the end of the calendar day")
     parser.add_argument("--target", type=float, default=0.02, help="the move to predict, as a fraction")
+    parser.add_argument("--moving-averages", default=",".join(map(str, DEFAULT_MOVING_AVERAGES)),
+                        help="comma-separated bar counts; each adds close relative to its intraday "
+                             "moving average as a feature (empty for none)")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -432,13 +465,19 @@ def main():
         parser.error(f"--thresholds wants numbers, got {args.thresholds!r}")
     if not thresholds:
         parser.error("--thresholds needs at least one value")
+    try:
+        moving_averages = [int(n) for n in args.moving_averages.split(",") if n.strip()]
+    except ValueError:
+        parser.error(f"--moving-averages wants whole numbers, got {args.moving_averages!r}")
+    if any(n < 1 for n in moving_averages):
+        parser.error("--moving-averages must all be at least 1")
 
     torch.manual_seed(args.seed)
     paths = [path.strip() for path in args.csv.split(",") if path.strip()]
 
     datasets = []
     for path in paths:
-        dataset, summary = dataset_from_csv(path, args.window, args.horizon, args.target)
+        dataset, summary = dataset_from_csv(path, args.window, args.horizon, args.target, moving_averages)
         print(f"{path}: {summary}")
         if len(dataset.x) == 0:
             print(f"  skipped: fewer than {args.window} usable rows "
@@ -489,7 +528,8 @@ def main():
     if args.save:
         torch.save({"state_dict": model.state_dict(), "mean": mean, "std": std,
                     "window": args.window, "horizon": args.horizon, "target": args.target,
-                    "features": FEATURE_NAMES, "sources": paths}, args.save)
+                    "features": feature_names(moving_averages), "moving_averages": moving_averages,
+                    "sources": paths}, args.save)
         print(f"saved to {args.save}")
 
 
