@@ -1,7 +1,7 @@
-"""A 1D CNN that flags bars from which price is likely to rise 2% within the next 20 rows.
+"""An LSTM that flags bars from which price is likely to rise 2% within the next 20 rows.
 
 Reads a CSV of `timestamp,open,high,low,close,volume`, turns it into overlapping
-windows of scale-free features, and trains a convolutional classifier on the binary
+windows of scale-free features, and trains a recurrent classifier on the binary
 label "did the high reach close * 1.02 within the next H rows *and* before midnight?".
 
 Only bars timestamped between 13:35 and 19:55 UTC inclusive are used; anything outside
@@ -280,7 +280,7 @@ def windows(features, labels, days, minutes, window: int):
     without enough history behind it. Checking only the last row isn't enough: a minute
     average is undefined for the start of every session, which a window can reach back into.
 
-    Returns X of shape [samples, features, window] — channels-first, as Conv1d wants —
+    Returns X of shape [samples, features, window] — channels-first; the model turns it round —
     and the index of each window's last row, so splits can stay chronological.
     """
     last_valid = np.flatnonzero(~np.isnan(labels))
@@ -374,29 +374,24 @@ def normalise(splits):
     return [((x - mean) / std, y) for x, y in splits], mean, std
 
 
-class StockCnn(nn.Module):
-    """Dilated 1D convolutions: each block doubles the receptive field over the window."""
+class StockLstm(nn.Module):
+    """A stacked LSTM read over the window oldest bar first, classifying from where it ends up.
 
-    def __init__(self, in_channels: int, channels: int = 32, blocks: int = 3, dropout: float = 0.2):
+    The prediction is made from the window's last bar, so the last time step's hidden
+    state -- the whole window folded into what matters as of now -- is what the head sees.
+    """
+
+    def __init__(self, in_channels: int, hidden: int = 64, layers: int = 2, dropout: float = 0.2):
         super().__init__()
-        layers = []
-        for block in range(blocks):
-            dilation = 2 ** block
-            layers += [
-                nn.Conv1d(in_channels if block == 0 else channels, channels,
-                          kernel_size=3, padding=dilation, dilation=dilation),
-                nn.BatchNorm1d(channels),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-            ]
-        self.convolutions = nn.Sequential(*layers)
-        # Mean and max pooling over time: "how much of this pattern" and "was it ever there".
-        self.head = nn.Linear(channels * 2, 1)
+        self.lstm = nn.LSTM(in_channels, hidden, num_layers=layers, batch_first=True,
+                            dropout=dropout if layers > 1 else 0.0)
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear(hidden, 1)
 
     def forward(self, x):
-        h = self.convolutions(x)                       # [batch, channels, window]
-        pooled = torch.cat([h.mean(dim=2), h.max(dim=2).values], dim=1)
-        return self.head(pooled).squeeze(1)            # [batch] logits
+        # Windows arrive channels-first, [batch, features, window]; the LSTM wants time second.
+        outputs, _ = self.lstm(x.transpose(1, 2))      # [batch, window, hidden]
+        return self.head(self.dropout(outputs[:, -1])).squeeze(1)   # [batch] logits
 
 
 def roc_auc(labels, scores):
@@ -415,11 +410,13 @@ def roc_auc(labels, scores):
     return (ranks[labels == 1].sum() - positives * (positives + 1) / 2) / (positives * negatives)
 
 
-def evaluate(model, x, y, device, thresholds=(0.3, 0.5, 0.7)):
+def evaluate(model, x, y, device, thresholds=(0.3, 0.5, 0.7), batch_size: int = 4096):
     model.eval()
+    # In batches: a whole split through an LSTM at once needs far more memory than a GPU has.
     with torch.no_grad():
-        logits = model(torch.from_numpy(x).to(device))
-        probabilities = torch.sigmoid(logits).cpu().numpy()
+        probabilities = np.concatenate([
+            torch.sigmoid(model(torch.from_numpy(x[start:start + batch_size]).to(device))).cpu().numpy()
+            for start in range(0, len(x), batch_size)]) if len(x) else np.empty(0, dtype=np.float32)
     report = {"auc": roc_auc(y, probabilities), "base_rate": float(y.mean()), "thresholds": {}}
     for threshold in thresholds:
         predicted = probabilities >= threshold
@@ -527,7 +524,7 @@ def main():
                                       "all trained and evaluated as one model "
                                       "(default: generate synthetic data)")
     parser.add_argument("--window", type=int, default=64,
-                        help="minutes of history the CNN sees; bars are merged into 1-minute bars as "
+                        help="minutes of history the LSTM sees; bars are merged into 1-minute bars as "
                              "they are read, and windows over a missing minute are skipped")
     parser.add_argument("--horizon", type=int, default=20,
                         help="rows ahead the 2%% move must happen in, capped at the end of the calendar day")
@@ -547,7 +544,7 @@ def main():
     parser.add_argument("--thresholds", default="0.3,0.5,0.7",
                         help="comma-separated probabilities at which to report precision/recall on the test set")
     parser.add_argument("--hits", help="write the correctly predicted test rows here, as CSV, and the most confident wrong ones alongside with _negative appended to the name")
-    parser.add_argument("--top", type=int, default=10,
+    parser.add_argument("--top", type=int, default=100,
                         help="how many of the most confident, non-overlapping predictions --hits writes to each file")
 
     parser.add_argument("--seed", type=int, default=0)
@@ -597,7 +594,7 @@ def main():
         print(f"{name:10s} {len(split_x):6d} windows, {split_y.mean():.2%} positive")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = StockCnn(in_channels=splits[0][0].shape[1]).to(device)
+    model = StockLstm(in_channels=splits[0][0].shape[1]).to(device)
     train(model, splits[0], splits[1], device, args.epochs, args.batch_size, args.learning_rate)
 
     report, probabilities = evaluate(model, *splits[2], device, thresholds)

@@ -88,7 +88,7 @@ def plot(groups, out: str = None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("hits", help="comma-separated CSV files written by StockCnn.py --hits")
-    parser.add_argument("--top", type=int, default=10, help="how many hits to plot")
+    parser.add_argument("--top", type=int, default=12, help="how many hits to plot")
     parser.add_argument("--out", help="write the figure here instead of opening a window "
                                       "(the default when no GUI backend is available)")
     args = parser.parse_args()
