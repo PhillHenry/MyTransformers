@@ -8,7 +8,8 @@ Only bars timestamped between 13:35 and 19:55 UTC inclusive are used; anything o
 that window is dropped as the file is read, so it contributes to neither features nor
 labels.
 
-Nothing is ever compared across working days. Every window lies wholly inside one UTC
+Nothing is ever compared across working days -- bar the optional N-day moving averages of
+the close, which only look back at finished days. Every window lies wholly inside one UTC
 day, the label's look-ahead stops at that day's last bar, and the backward-looking
 features -- the return and the volume change -- are never taken from yesterday's close
 against today's open. A day is therefore self-contained: the overnight gap is not a
@@ -40,7 +41,7 @@ from torch import nn
 
 FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close", "log_volume_change",
                  "time_of_day", "bars_elapsed_today"]
-DEFAULT_MOVING_AVERAGES = (50, 100, 200)
+DEFAULT_MOVING_AVERAGES = (50, 100)
 
 
 def feature_names(moving_averages=DEFAULT_MOVING_AVERAGES):
@@ -120,18 +121,23 @@ def bars_into_day(days):
     return np.arange(len(days)) - np.repeat(first_of_day, np.diff(np.append(first_of_day, len(days))))
 
 
-def intraday_moving_average(close, days, window: int):
-    """Trailing mean of `close` over the last `window` bars *of the same day*, current bar included.
+def daily_moving_average(close, days, window: int):
+    """Per row, the mean of the last `window` days' closing prices, *not* counting the row's own day.
 
-    Early in a session there are fewer than `window` bars to average, so the mean is
-    taken over however many the day has had so far rather than reaching back into
-    yesterday. The bars-elapsed feature tells the model how full the average is.
+    A day's close is its last in-session bar, and today's hasn't happened yet, so only
+    finished days go into the average: a bar at 14:00 can't know where 19:55 will be.
+    Days are the ones present in the data, i.e. trading days. Rows without `window`
+    finished days behind them get NaN, not an average over fewer days -- that would put
+    short, noisy averages at the start of every file, which is exactly the training split.
     """
-    elapsed = bars_into_day(days)
-    cumulative = np.concatenate([[0.0], np.cumsum(close)])
-    end = np.arange(1, len(close) + 1)
-    start = end - 1 - np.minimum(elapsed, window - 1)
-    return (cumulative[end] - cumulative[start]) / (end - start)
+    _, first_of_day, day_index = np.unique(days, return_index=True, return_inverse=True)
+    last_of_day = np.append(first_of_day[1:], len(days)) - 1
+    daily_close = close[last_of_day]
+    cumulative = np.concatenate([[0.0], np.cumsum(daily_close)])
+    # Entry k is the mean of daily closes k-window .. k-1, for every day k with that many before it.
+    averages = np.full(len(daily_close), np.nan)
+    averages[window:] = (cumulative[window:-1] - cumulative[:-window - 1]) / window
+    return averages[day_index]
 
 
 def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
@@ -153,14 +159,19 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
     the close therefore have fewer chances, which is why the clock is a feature: with
     no notion of time the model could only average over "how much day is left".
 
-    Each of `moving_averages` adds a channel: how far the close sits above or below its
-    intraday moving average over that many bars, as a fraction, so it too is scale-free.
+    Each of `moving_averages` adds a channel: how far the close sits above or below the
+    moving average of that many previous days' closes, as a fraction, so it too is
+    scale-free. These are the one deliberate exception to staying inside a day -- a
+    multi-day trend is the point of them -- but they only look back at finished days.
+    Rows too early in the file to have the longest average get no label, and so no window.
     """
     open_, high, low, close, volume = (prices[:, i] for i in range(5))
 
     # True where the diff below spans midnight: row i-1 is yesterday, row i is today.
     overnight = days[1:] != days[:-1]
-    all_days = days
+    # Computed on every row, the first included, so row 0 can still close its day.
+    close_vs_averages = [close[1:] / daily_moving_average(close, days, n)[1:] - 1.0
+                         for n in moving_averages]
     days, time_of_day = days[1:], time_of_day[1:]
 
     # Zero is a placeholder, not a measurement: `windows` never lets these rows reach the
@@ -175,10 +186,6 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
     # How far into its day each bar is, counted in bars: the clock as the data actually
     # samples it, which is what limits how many chances the 2% move has left.
     bars_elapsed = bars_into_day(days)
-
-    # Averaged over the full file's days, then cut to row 1 onwards like everything else.
-    close_vs_averages = [close[1:] / intraday_moving_average(close, all_days, n)[1:] - 1.0
-                         for n in moving_averages]
 
     features = np.stack([log_return, high_vs_close, low_vs_close, open_vs_close, log_volume_change,
                          time_of_day, np.log1p(bars_elapsed), *close_vs_averages], axis=1)
@@ -195,6 +202,9 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
             labels[i] = np.nan                               # this day may continue past the file
         else:
             labels[i] = 0.0                                  # includes bars whose day simply ran out
+    # No label where a moving average is still undefined, so `windows` never ends on such a row;
+    # a window is one day long, so none of its rows are undefined either.
+    labels[np.isnan(features).any(axis=1)] = np.nan
 
     return features.astype(np.float32), labels.astype(np.float32)
 
@@ -444,8 +454,9 @@ def main():
                         help="rows ahead the 2%% move must happen in, capped at the end of the calendar day")
     parser.add_argument("--target", type=float, default=0.02, help="the move to predict, as a fraction")
     parser.add_argument("--moving-averages", default=",".join(map(str, DEFAULT_MOVING_AVERAGES)),
-                        help="comma-separated bar counts; each adds close relative to its intraday "
-                             "moving average as a feature (empty for none)")
+                        help="comma-separated day counts; each adds close relative to the moving average "
+                             "of that many previous days' closes as a feature (empty for none). Days "
+                             "before the longest average is available produce no samples")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -481,7 +492,8 @@ def main():
         print(f"{path}: {summary}")
         if len(dataset.x) == 0:
             print(f"  skipped: fewer than {args.window} usable rows "
-                  f"between {SESSION_START:%H:%M} and {SESSION_END:%H:%M} UTC")
+                  f"between {SESSION_START:%H:%M} and {SESSION_END:%H:%M} UTC"
+                  + (f" after the first {max(moving_averages)} days" if moving_averages else ""))
             continue
         datasets.append(dataset)
     if not datasets:
