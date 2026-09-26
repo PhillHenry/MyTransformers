@@ -8,6 +8,9 @@ Only bars timestamped between 13:35 and 19:55 UTC inclusive are used; anything o
 that window is dropped as the file is read, so it contributes to neither features nor
 labels.
 
+Finer bars are merged into 1-minute bars as they are read, so a row is a minute in every
+file and `--window` is a number of minutes.
+
 Nothing is ever compared across working days -- bar the optional N-day moving averages of
 the close, which only look back at finished days. Every window lies wholly inside one UTC
 day, the label's look-ahead stops at that day's last bar, and the backward-looking
@@ -94,11 +97,35 @@ def read_csv(path: str):
     timestamps = [timestamp for timestamp, _ in stamped]
     prices = np.array([[float(row[c]) for c in ("open", "high", "low", "close", "volume")]
                        for _, row in stamped], dtype=np.float64).reshape(-1, 5)
-    return timestamps, prices
+    return to_minute_bars(timestamps, prices)
+
+
+def to_minute_bars(timestamps, prices):
+    """Merge bars that share a clock minute into one 1-minute bar, stamped with that minute.
+
+    Files come at different resolutions -- some in 1-minute bars, some in 15-second
+    ones -- and one model needs one: after this a row is a minute everywhere, so a
+    window of N rows is N minutes whatever file it came from. Already-1-minute files
+    pass through unchanged. Minutes with no bar at all stay missing; `windows` skips them.
+    """
+    if not timestamps:
+        return timestamps, prices
+    minutes = [t.replace(second=0, microsecond=0) for t in timestamps]
+    starts = np.flatnonzero([True] + [a != b for a, b in zip(minutes[1:], minutes[:-1])])
+    ends = np.append(starts[1:], len(minutes)) - 1
+    merged = np.stack([prices[starts, 0],
+                       np.maximum.reduceat(prices[:, 1], starts),
+                       np.minimum.reduceat(prices[:, 2], starts),
+                       prices[ends, 3],
+                       np.add.reduceat(prices[:, 4], starts)], axis=1)
+    return [minutes[i] for i in starts], merged
 
 
 def calendar_columns(timestamps):
     """Day number (for grouping) and time of day as a fraction, per row.
+
+    `minute_number` turns the pair into an absolute count of minutes, for measuring
+    how much time a run of rows spans.
 
     Both are taken in UTC, which is the zone the session itself is defined in: a local
     date would cut one 13:35-19:55 session into two "days" wherever the offset puts its
@@ -109,6 +136,11 @@ def calendar_columns(timestamps):
     days = np.array([t.date().toordinal() for t in timestamps], dtype=np.int64)
     seconds = np.array([t.hour * 3600 + t.minute * 60 + t.second for t in timestamps], dtype=np.float64)
     return days, seconds / 86400.0
+
+
+def minute_number(days, time_of_day):
+    """Minutes since the start of the proleptic calendar, per row, from `calendar_columns`."""
+    return days * 1440 + np.rint(time_of_day * 1440).astype(np.int64)
 
 
 def bars_into_day(days):
@@ -209,14 +241,19 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
     return features.astype(np.float32), labels.astype(np.float32)
 
 
-def windows(features, labels, days, window: int):
-    """Every window of `window` consecutive rows *from a single day*, labelled by its final row.
+def windows(features, labels, days, minutes, window: int):
+    """Every `window`-minute stretch of rows *from a single day*, labelled by its final row.
+
+    Rows are 1-minute bars (see `to_minute_bars`), so a window is `window` rows -- but
+    only kept when those rows are `window` consecutive minutes, per `minutes`. A window
+    over a gap in the data would cover more time than it claims to, and the model would
+    see a jump it couldn't tell from a real one-minute move.
 
     A window is kept only when its first row is at least `window` bars into the day its
     last row belongs to. That puts the whole window inside one working day and past the
     day's opening bar, so no row in it was derived by comparing today with yesterday.
-    The first `window` bars of each session therefore produce no sample -- there is not
-    yet enough of the day to look back over.
+    The first `window` minutes of each session therefore produce no sample -- there is
+    not yet enough of the day to look back over.
 
     Returns X of shape [samples, features, window] — channels-first, as Conv1d wants —
     and the index of each window's last row, so splits can stay chronological.
@@ -224,6 +261,7 @@ def windows(features, labels, days, window: int):
     last_valid = np.flatnonzero(~np.isnan(labels))
     elapsed = bars_into_day(days)
     ends = last_valid[elapsed[last_valid] >= window]
+    ends = ends[minutes[ends] - minutes[ends - window + 1] == window - 1]
     if ends.size == 0:                                       # no day long enough for one window
         return np.empty((0, features.shape[1], window), dtype=features.dtype), labels[ends], ends
     x = np.stack([features[end - window + 1:end + 1].T for end in ends])
@@ -247,14 +285,14 @@ def dataset_from_csv(path: str, window: int, horizon: int, target: float,
     days, time_of_day = calendar_columns(timestamps)
     unique_days, bars_per_day = np.unique(days, return_counts=True)
     features, labels = features_and_labels(prices, days, time_of_day, horizon, target, moving_averages)
-    x, y, ends = windows(features, labels, days[1:], window)
+    x, y, ends = windows(features, labels, days[1:], minute_number(days, time_of_day)[1:], window)
     # Features start at row 1 -- row 0 has no previous bar to take a return from -- so a
     # window ending at feature `end` is a window ending at price row `end + 1`.
     dataset = Dataset(path, x, y, ends + 1, timestamps, prices)
     positive = y.mean() if len(y) else float("nan")
     median_bars = int(np.median(bars_per_day)) if len(bars_per_day) else 0
-    return dataset, (f"{len(prices)} rows in session over {len(unique_days)} calendar days, "
-                     f"median {median_bars} bars per day, "
+    return dataset, (f"{len(prices)} minutes in session over {len(unique_days)} calendar days, "
+                     f"median {median_bars} per day, "
                      f"{len(x)} windows, {positive:.2%} positive")
 
 
@@ -449,7 +487,9 @@ def main():
     parser.add_argument("--csv", help="comma-separated timestamp,open,high,low,close,volume files, "
                                       "all trained and evaluated as one model "
                                       "(default: generate synthetic data)")
-    parser.add_argument("--window", type=int, default=64, help="rows of history the CNN sees")
+    parser.add_argument("--window", type=int, default=64,
+                        help="minutes of history the CNN sees; bars are merged into 1-minute bars as "
+                             "they are read, and windows over a missing minute are skipped")
     parser.add_argument("--horizon", type=int, default=20,
                         help="rows ahead the 2%% move must happen in, capped at the end of the calendar day")
     parser.add_argument("--target", type=float, default=0.02, help="the move to predict, as a fraction")
@@ -491,7 +531,7 @@ def main():
         dataset, summary = dataset_from_csv(path, args.window, args.horizon, args.target, moving_averages)
         print(f"{path}: {summary}")
         if len(dataset.x) == 0:
-            print(f"  skipped: fewer than {args.window} usable rows "
+            print(f"  skipped: no {args.window} unbroken minutes of labelled rows "
                   f"between {SESSION_START:%H:%M} and {SESSION_END:%H:%M} UTC"
                   + (f" after the first {max(moving_averages)} days" if moving_averages else ""))
             continue
