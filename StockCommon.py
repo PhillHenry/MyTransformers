@@ -22,6 +22,9 @@ signal the model can see or learn.
 
 The same-calendar-day constraint means the effective horizon shrinks as the session
 runs down, so the timestamp itself becomes predictive and is fed in as a feature.
+
+With --baseline, another file -- an index, say -- has the same features computed on its
+own bars, and they are set beside each file's, minute by minute.
 """
 import argparse
 import csv
@@ -38,14 +41,22 @@ FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close",
                  "time_of_day", "bars_elapsed_today"]
 
 
-def feature_names(moving_averages=(), minute_moving_averages=()):
+# The features that describe the clock rather than the instrument: a baseline shares them.
+CLOCK_FEATURES = ["time_of_day", "bars_elapsed_today"]
+
+
+def feature_names(moving_averages=(), minute_moving_averages=(), baseline: bool = False):
     """The fixed features followed by two channels per moving-average window -- the close against
-    the average, then the average's change -- the day-long averages first."""
-    return (FEATURE_NAMES
-            + [name for window in moving_averages
-               for name in (f"close_vs_ma{window}", f"ma{window}_change")]
-            + [name for window in minute_moving_averages
-               for name in (f"close_vs_ma{window}min", f"ma{window}min_change")])
+    the average, then the average's change -- the day-long averages first. With a baseline, its
+    own copy of all of those but the clock follows, each prefixed `baseline_`."""
+    names = (FEATURE_NAMES
+             + [name for window in moving_averages
+                for name in (f"close_vs_ma{window}", f"ma{window}_change")]
+             + [name for window in minute_moving_averages
+                for name in (f"close_vs_ma{window}min", f"ma{window}min_change")])
+    if baseline:
+        names += [f"baseline_{name}" for name in names if name not in CLOCK_FEATURES]
+    return names
 
 # The only bars the model ever sees, inclusive of both ends. Everything outside is
 # dropped as it is read, so the session boundaries look to the rest of the code exactly
@@ -227,6 +238,25 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
     Those stay inside the day, so rows in the first `window` minutes of each session
     are NaN too.
     """
+    features = bar_features(prices, days, time_of_day, moving_averages, minute_moving_averages)
+    close_, high_, days = prices[1:, 3], prices[1:, 1], days[1:]
+    n = len(close_)
+    labels = np.full(n, np.nan)
+    for i in range(n):
+        stop = min(i + horizon, n - 1)                       # last row the horizon reaches
+        ahead = high_[i + 1:stop + 1][days[i + 1:stop + 1] == days[i]]
+        if ahead.size and ahead.max() >= close_[i] * (1.0 + target):
+            labels[i] = 1.0
+        elif i + horizon > n - 1 and days[i] == days[-1]:
+            labels[i] = np.nan                               # this day may continue past the file
+        else:
+            labels[i] = 0.0                                  # includes bars whose day simply ran out
+
+    return features, labels.astype(np.float32)
+
+
+def bar_features(prices, days, time_of_day, moving_averages=(), minute_moving_averages=()):
+    """The features of rows 1 onwards, in `feature_names` order; see `features_and_labels`."""
     open_, high, low, close, volume = (prices[:, i] for i in range(5))
 
     # True where the diff below spans midnight: row i-1 is yesterday, row i is today.
@@ -255,21 +285,46 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
 
     features = np.stack([log_return, high_vs_close, low_vs_close, open_vs_close, log_volume_change,
                          time_of_day, np.log1p(bars_elapsed), *close_vs_averages], axis=1)
+    return features.astype(np.float32)
 
-    close_, high_ = close[1:], high[1:]
-    n = len(close_)
-    labels = np.full(n, np.nan)
-    for i in range(n):
-        stop = min(i + horizon, n - 1)                       # last row the horizon reaches
-        ahead = high_[i + 1:stop + 1][days[i + 1:stop + 1] == days[i]]
-        if ahead.size and ahead.max() >= close_[i] * (1.0 + target):
-            labels[i] = 1.0
-        elif i + horizon > n - 1 and days[i] == days[-1]:
-            labels[i] = np.nan                               # this day may continue past the file
-        else:
-            labels[i] = 0.0                                  # includes bars whose day simply ran out
 
-    return features.astype(np.float32), labels.astype(np.float32)
+class Baseline(NamedTuple):
+    """Another instrument's features, keyed by minute, to be set beside each dataset's own."""
+    path: str
+    minutes: np.ndarray                                      # sorted, one per row of `features`
+    features: np.ndarray
+
+
+def read_baseline(path: str, moving_averages=(), minute_moving_averages=()):
+    """The baseline file's features, all of an instrument's but the clock, which a dataset has already.
+
+    They are the baseline's own: its returns are against its own previous bar, its
+    averages over its own days and minutes. Its opening bar each day is NaN rather than
+    the placeholder zero an instrument gets there -- an instrument's windows start after
+    its own opening bar, but the baseline's may open later than the instrument's does.
+    """
+    timestamps, prices = read_csv(path)
+    days, time_of_day = calendar_columns(timestamps)
+    features = bar_features(prices, days, time_of_day, moving_averages, minute_moving_averages)
+    names = feature_names(moving_averages, minute_moving_averages)
+    features = np.delete(features, [names.index(name) for name in CLOCK_FEATURES], axis=1)
+    features[bars_into_day(days[1:]) == 0] = np.nan
+    return Baseline(path, minute_number(days, time_of_day)[1:], features)
+
+
+def join_baseline(features, minutes, baseline: Baseline):
+    """`features` with the baseline's appended to each row from the same minute; NaN where it has none.
+
+    Rows are kept rather than dropped where the baseline is missing, so the labels -- which
+    look ahead over the instrument's own rows -- come out exactly as they would without it.
+    `windows` skips any window with a NaN in it.
+    """
+    joined = np.full((len(features), baseline.features.shape[1]), np.nan, dtype=np.float32)
+    if len(baseline.minutes):
+        position = np.searchsorted(baseline.minutes, minutes).clip(max=len(baseline.minutes) - 1)
+        found = baseline.minutes[position] == minutes
+        joined[found] = baseline.features[position[found]]
+    return np.concatenate([features, joined], axis=1)
 
 
 def windows(features, labels, days, minutes, window: int):
@@ -316,14 +371,17 @@ class Dataset(NamedTuple):
 
 
 def dataset_from_csv(path: str, window: int, horizon: int, target: float,
-                     moving_averages=(), minute_moving_averages=()):
+                     moving_averages=(), minute_moving_averages=(), baseline: Baseline = None):
     """One file's dataset, plus a line describing what was in it."""
     timestamps, prices = read_csv(path)
     days, time_of_day = calendar_columns(timestamps)
     unique_days, bars_per_day = np.unique(days, return_counts=True)
     features, labels = features_and_labels(prices, days, time_of_day, horizon, target,
                                            moving_averages, minute_moving_averages)
-    x, y, ends = windows(features, labels, days[1:], minute_number(days, time_of_day)[1:], window)
+    minutes = minute_number(days, time_of_day)[1:]
+    if baseline is not None:
+        features = join_baseline(features, minutes, baseline)
+    x, y, ends = windows(features, labels, days[1:], minutes, window)
     # Features start at row 1 -- row 0 has no previous bar to take a return from -- so a
     # window ending at feature `end` is a window ending at price row `end + 1`.
     dataset = Dataset(path, x, y, ends + 1, timestamps, prices)
@@ -534,6 +592,10 @@ def main(make_model, description: str):
                              "of that many minutes of the same day's closes as a feature (default: none). "
                              "The first minutes of each session, before the longest is available, "
                              "produce no samples")
+    parser.add_argument("--baseline",
+                        help="a CSV in the same format -- an index, say -- whose features, moving averages "
+                             "and their changes included, are set beside every file's own, matched by "
+                             "minute. Windows over a minute the baseline lacks are skipped")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -558,18 +620,24 @@ def main(make_model, description: str):
 
     torch.manual_seed(args.seed)
     paths = [path.strip() for path in args.csv.split(",") if path.strip()]
+    baseline = None
+    if args.baseline:
+        baseline = read_baseline(args.baseline, moving_averages, minute_moving_averages)
+        print(f"{args.baseline}: baseline of {len(baseline.minutes)} minutes, "
+              f"{baseline.features.shape[1]} features")
 
     datasets = []
     for path in paths:
         dataset, summary = dataset_from_csv(path, args.window, args.horizon, args.target,
-                                            moving_averages, minute_moving_averages)
+                                            moving_averages, minute_moving_averages, baseline)
         print(f"{path}: {summary}")
         if len(dataset.x) == 0:
             print(f"  skipped: no {args.window} unbroken minutes of labelled rows "
                   f"between {SESSION_START:%H:%M} and {SESSION_END:%H:%M} UTC"
                   + (f" after the first {max(moving_averages)} days" if moving_averages else "")
                   + (f" and {max(minute_moving_averages)} minutes of each session"
-                     if minute_moving_averages else ""))
+                     if minute_moving_averages else "")
+                  + (" that the baseline also covers" if baseline else ""))
             continue
         datasets.append(dataset)
     if not datasets:
@@ -616,7 +684,7 @@ def main(make_model, description: str):
     if args.save:
         torch.save({"model": type(model).__name__, "state_dict": model.state_dict(), "mean": mean, "std": std,
                     "window": args.window, "horizon": args.horizon, "target": args.target,
-                    "features": feature_names(moving_averages, minute_moving_averages),
+                    "features": feature_names(moving_averages, minute_moving_averages, baseline is not None),
                     "moving_averages": moving_averages, "minute_moving_averages": minute_moving_averages,
-                    "sources": paths}, args.save)
+                    "sources": paths, "baseline": args.baseline}, args.save)
         print(f"saved to {args.save}")
