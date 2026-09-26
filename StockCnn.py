@@ -8,6 +8,12 @@ Only bars timestamped between 13:35 and 19:55 UTC inclusive are used; anything o
 that window is dropped as the file is read, so it contributes to neither features nor
 labels.
 
+Nothing is ever compared across working days. Every window lies wholly inside one UTC
+day, the label's look-ahead stops at that day's last bar, and the backward-looking
+features -- the return and the volume change -- are never taken from yesterday's close
+against today's open. A day is therefore self-contained: the overnight gap is not a
+signal the model can see or learn.
+
 The same-calendar-day constraint means the effective horizon shrinks as the session
 runs down, so the timestamp itself becomes predictive and is fed in as a feature.
 
@@ -53,14 +59,18 @@ def parse_timestamp(raw: str) -> dt.datetime:
     return dt.datetime.fromtimestamp(number / 1000.0 if number > 1e11 else number, tz=dt.timezone.utc)
 
 
+def as_utc(timestamp: dt.datetime) -> dt.datetime:
+    """The same instant in UTC; a naive stamp is taken to be UTC already."""
+    return timestamp.astimezone(dt.timezone.utc) if timestamp.tzinfo is not None else timestamp
+
+
 def in_session(timestamp: dt.datetime) -> bool:
     """Does this bar fall inside the 13:35-19:55 UTC window?
 
     Offset-aware stamps are converted; naive ones are taken to be UTC already, since
     there is nothing else to go on.
     """
-    utc = timestamp.astimezone(dt.timezone.utc) if timestamp.tzinfo is not None else timestamp
-    return SESSION_START <= utc.time() <= SESSION_END
+    return SESSION_START <= as_utc(timestamp).time() <= SESSION_END
 
 
 def read_csv(path: str):
@@ -83,16 +93,25 @@ def read_csv(path: str):
 def calendar_columns(timestamps):
     """Day number (for grouping) and time of day as a fraction, per row.
 
-    Mixed time zones in one file would put bars in the wrong day, so if the stamps
-    are offset-aware they are all converted to the first one's zone before the date
-    is taken.
+    Both are taken in UTC, which is the zone the session itself is defined in: a local
+    date would cut one 13:35-19:55 session into two "days" wherever the offset puts its
+    two ends on either side of local midnight, and mixed zones in one file would scatter
+    bars across days that never traded together.
     """
-    if timestamps and timestamps[0].tzinfo is not None:
-        zone = timestamps[0].tzinfo
-        timestamps = [t.astimezone(zone) for t in timestamps]
+    timestamps = [as_utc(t) for t in timestamps]
     days = np.array([t.date().toordinal() for t in timestamps], dtype=np.int64)
     seconds = np.array([t.hour * 3600 + t.minute * 60 + t.second for t in timestamps], dtype=np.float64)
     return days, seconds / 86400.0
+
+
+def bars_into_day(days):
+    """How many bars each row sits after the first bar of its own day.
+
+    Zero marks a day's opening bar, which is the one row whose backward-looking
+    features would otherwise reach into the previous day.
+    """
+    _, first_of_day = np.unique(days, return_index=True)
+    return np.arange(len(days)) - np.repeat(first_of_day, np.diff(np.append(first_of_day, len(days))))
 
 
 def features_and_labels(prices, days, time_of_day, horizon: int, target: float):
@@ -102,6 +121,12 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float):
     level: a model trained on a $10 stock should still work when it trades at $200.
     Row 0 is dropped because the return features need a previous row.
 
+    Every comparison stays inside one working day. The two backward-looking features --
+    the return and the volume change -- are diffs against the previous row, so on a day's
+    opening bar they would measure today against yesterday's close: an overnight gap, not
+    an intraday move. Those rows are neutralised here and their windows are dropped in
+    `windows`, so nothing the model sees crosses a day boundary.
+
     The label for row i is 1 when some bar in rows i+1 .. i+horizon *that falls on the
     same calendar day as row i* trades at or above close[i] * (1 + target). Rows near
     the close therefore have fewer chances, which is why the clock is a feature: with
@@ -109,17 +134,22 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float):
     """
     open_, high, low, close, volume = (prices[:, i] for i in range(5))
 
-    log_return = np.diff(np.log(close))
+    # True where the diff below spans midnight: row i-1 is yesterday, row i is today.
+    overnight = days[1:] != days[:-1]
+    days, time_of_day = days[1:], time_of_day[1:]
+
+    # Zero is a placeholder, not a measurement: `windows` never lets these rows reach the
+    # model, and an overnight gap left in place would be the largest "return" in the file.
+    log_return = np.where(overnight, 0.0, np.diff(np.log(close)))
+    log_volume_change = np.where(overnight, 0.0, np.diff(np.log1p(volume)))
+    # The rest compare a bar with itself, so they are intraday whatever day they fall on.
     high_vs_close = (high[1:] / close[1:]) - 1.0
     low_vs_close = (low[1:] / close[1:]) - 1.0
     open_vs_close = (open_[1:] / close[1:]) - 1.0
-    log_volume_change = np.diff(np.log1p(volume))
 
-    days, time_of_day = days[1:], time_of_day[1:]
     # How far into its day each bar is, counted in bars: the clock as the data actually
     # samples it, which is what limits how many chances the 2% move has left.
-    _, first_of_day = np.unique(days, return_index=True)
-    bars_elapsed = np.arange(len(days)) - np.repeat(first_of_day, np.diff(np.append(first_of_day, len(days))))
+    bars_elapsed = bars_into_day(days)
 
     features = np.stack([log_return, high_vs_close, low_vs_close, open_vs_close, log_volume_change,
                          time_of_day, np.log1p(bars_elapsed)], axis=1)
@@ -140,15 +170,22 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float):
     return features.astype(np.float32), labels.astype(np.float32)
 
 
-def windows(features, labels, window: int):
-    """Every window of `window` consecutive rows, labelled by its final row.
+def windows(features, labels, days, window: int):
+    """Every window of `window` consecutive rows *from a single day*, labelled by its final row.
+
+    A window is kept only when its first row is at least `window` bars into the day its
+    last row belongs to. That puts the whole window inside one working day and past the
+    day's opening bar, so no row in it was derived by comparing today with yesterday.
+    The first `window` bars of each session therefore produce no sample -- there is not
+    yet enough of the day to look back over.
 
     Returns X of shape [samples, features, window] — channels-first, as Conv1d wants —
     and the index of each window's last row, so splits can stay chronological.
     """
     last_valid = np.flatnonzero(~np.isnan(labels))
-    ends = last_valid[last_valid >= window - 1]
-    if ends.size == 0:                                       # a file shorter than one window
+    elapsed = bars_into_day(days)
+    ends = last_valid[elapsed[last_valid] >= window]
+    if ends.size == 0:                                       # no day long enough for one window
         return np.empty((0, features.shape[1], window), dtype=features.dtype), labels[ends], ends
     x = np.stack([features[end - window + 1:end + 1].T for end in ends])
     return x, labels[ends], ends
@@ -170,7 +207,7 @@ def dataset_from_csv(path: str, window: int, horizon: int, target: float):
     days, time_of_day = calendar_columns(timestamps)
     unique_days, bars_per_day = np.unique(days, return_counts=True)
     features, labels = features_and_labels(prices, days, time_of_day, horizon, target)
-    x, y, ends = windows(features, labels, window)
+    x, y, ends = windows(features, labels, days[1:], window)
     # Features start at row 1 -- row 0 has no previous bar to take a return from -- so a
     # window ending at feature `end` is a window ending at price row `end + 1`.
     dataset = Dataset(path, x, y, ends + 1, timestamps, prices)
@@ -302,6 +339,9 @@ def write_hits(path: str, datasets, origins, labels, probabilities, top: int, ma
     Neighbouring bars tend to score alike, so the best hits cluster around the same move. A
     hit whose context would overlap one already chosen from the same file is skipped, which
     keeps every row in the output to a single group and spreads the `top` over distinct moves.
+
+    The context stops at the ends of the hit's own day, so reading a hit's rows off the file
+    never puts the previous session's prices next to this one's.
     """
     candidates = np.flatnonzero(labels == label)
     candidates = candidates[np.argsort(-probabilities[candidates], kind="stable")]
@@ -321,7 +361,10 @@ def write_hits(path: str, datasets, origins, labels, probabilities, top: int, ma
         for hit, index in enumerate(chosen):
             file_index, row = origins[index]
             dataset = datasets[file_index]
+            day = as_utc(dataset.timestamps[row]).date()
             for context in range(max(row - margin, 0), min(row + margin + 1, len(dataset.prices))):
+                if as_utc(dataset.timestamps[context]).date() != day:
+                    continue
                 writer.writerow([hit, dataset.path, context - row, f"{probabilities[index]:.6f}",
                                  dataset.timestamps[context].isoformat(), *dataset.prices[context]])
     return len(chosen)
