@@ -10,14 +10,13 @@ bar the prediction was made from (offset 0), then over the next --horizon bars
 
 Pass both files --hits writes, the correct predictions and the wrong ones:
 
-    python Backtesting.py hits.csv,hits_negative.csv --threshold 0.9
-    python Backtesting.py hits.csv,hits_negative.csv --threshold 0.9 --trades trades.csv
+    python Backtesting.py hits.csv,hits_negative.csv --threshold 0.9 --horizon 60
+    python Backtesting.py hits.csv,hits_negative.csv --threshold 0.9 --horizon 60 --trades trades.csv
 
-A caution on reading the result: the hits files are not every signal the model gave.
-Each holds only the --top most confident non-overlapping windows *of one outcome*, so
-the mix of winners and losers here is whatever --top made it, not the mix the model
-would really produce. The per-file lines are the trustworthy part -- how much the
-correct calls made and how much the wrong ones cost -- more than the combined total.
+Between them the two files hold every window of the test split, so the trades here are
+every signal the model gave at --threshold -- less those that came while a position in the
+same instrument was still open, which are passed over. Trades never overlap on one
+instrument, so the combined line is what the strategy would have made.
 """
 import argparse
 import os
@@ -39,6 +38,7 @@ class Trade(NamedTuple):
     exit: float
     exit_reason: str                                         # "target" or "average"
     bars_held: int
+    exit_timestamp: pd.Timestamp                             # the bar it sold on, or the horizon's last
 
     @property
     def gain(self) -> float:
@@ -48,25 +48,36 @@ class Trade(NamedTuple):
 class Backtest:
     """Trades every hit at or above `threshold`, exiting at `target` or the `horizon`'s average close.
 
-    `horizon` of None takes each hit's horizon from its own file: --hits writes `horizon`
-    rows either side of the prediction, so the furthest offset in a group is the horizon
-    (unless the day ended first, in which case there is nothing further to trade on anyway).
+    Only one position per instrument is open at a time: a signal that comes while the
+    last trade on its instrument has yet to sell is passed over, however confident. An
+    average-price exit sells across the whole horizon, so that position is open until
+    the horizon's last bar. Instruments are independent -- positions in different ones
+    can be open together.
     """
 
-    def __init__(self, threshold: float, target: float, horizon: int = None):
+    def __init__(self, threshold: float, target: float, horizon: int):
         self.threshold = threshold
         self.target = target
         self.horizon = horizon
         self.trades = []
         self.untradeable = 0                                 # hits with no bar after offset 0
+        self.overlapping = 0                                 # signals while a position was open
 
     def run(self, paths):
-        """Every trade from `paths`, in the order they were made."""
+        """Every trade from `paths`, in the order they were made, none overlapping another on its instrument."""
         for path in paths:
-            for group in read_hits([path]):
-                if group["probability"].iloc[0] >= self.threshold:
-                    self.trade(path, group)
+            for group in read_hits([path], self.horizon, self.threshold):
+                self.trade(path, group)
+        # Across all the files at once: one instrument's signals are split between them.
         self.trades.sort(key=lambda trade: trade.timestamp)
+        kept, sold = [], {}                                  # source -> when its open position sells
+        for trade in self.trades:
+            if trade.source in sold and trade.timestamp <= sold[trade.source]:
+                self.overlapping += 1
+                continue
+            kept.append(trade)
+            sold[trade.source] = trade.exit_timestamp
+        self.trades = kept
         return self.trades
 
     def trade(self, path: str, group: pd.DataFrame):
@@ -76,8 +87,7 @@ class Backtest:
             return
         entry_row = entry_row.iloc[0]
         entry = float(entry_row["close"])
-        horizon = self.horizon if self.horizon is not None else int(group["offset"].max())
-        after = group[(group["offset"] >= 1) & (group["offset"] <= horizon)]
+        after = group[(group["offset"] >= 1) & (group["offset"] <= self.horizon)]
         if after.empty:                                      # predicted on the day's last bar
             self.untradeable += 1
             return
@@ -86,11 +96,13 @@ class Backtest:
         reached = np.flatnonzero(after["high"].to_numpy() >= goal)
         if reached.size:
             bar = after.iloc[reached[0]]
-            exit_price, reason, held = max(goal, float(bar["open"])), "target", int(bar["offset"])
+            exit_price, reason = max(goal, float(bar["open"])), "target"
         else:
-            exit_price, reason, held = float(after["close"].mean()), "average", int(after["offset"].max())
+            bar = after.iloc[-1]
+            exit_price, reason = float(after["close"].mean()), "average"
         self.trades.append(Trade(path, entry_row["source"], entry_row["timestamp"],
-                                 float(entry_row["probability"]), entry, exit_price, reason, held))
+                                 float(entry_row["probability"]), entry, exit_price, reason,
+                                 int(bar["offset"]), bar["timestamp"]))
 
     @staticmethod
     def summary(trades) -> str:
@@ -112,13 +124,13 @@ def main():
                         help="trade only hits whose probability is at least this")
     parser.add_argument("--target", type=float, default=0.02,
                         help="the gain, as a fraction, at which to sell; use the value the model was trained with")
-    parser.add_argument("--horizon", type=int,
-                        help="bars after the buy to wait for the target, and to average over if it never comes "
-                             "(default: as many as the hits file holds, which is the model's --horizon)")
+    parser.add_argument("--horizon", type=int, required=True,
+                        help="bars after the buy to wait for the target, and to average over if it never comes; "
+                             "the model's --horizon, or less, since that is all the file holds")
     parser.add_argument("--trades", help="write every simulated trade here, as CSV")
     args = parser.parse_args()
 
-    if args.horizon is not None and args.horizon < 1:
+    if args.horizon < 1:
         parser.error("--horizon needs to be at least 1")
     paths = [path.strip() for path in args.hits.split(",") if path.strip()]
 
@@ -127,13 +139,16 @@ def main():
     for trade in trades:
         print(f"{trade.timestamp:%Y-%m-%d %H:%M}  {os.path.basename(trade.source).split('_')[0]:6s} "
               f"p={trade.probability:.3f}  bought {trade.entry:.2f}  sold {trade.exit:.2f} "
-              f"({trade.exit_reason}, {trade.bars_held} bars)  {trade.gain:+.3%}")
+              f"({trade.exit_reason}, {trade.bars_held} bars, to {trade.exit_timestamp:%H:%M})  {trade.gain:+.3%}")
     for path in paths:
         print(f"{path}: {Backtest.summary([t for t in trades if t.hits_file == path])}")
     if len(paths) > 1:
         print(f"all: {Backtest.summary(trades)}")
     if trades:
         print(f"average gain over all {len(trades)} trades: {np.mean([t.gain for t in trades]):+.3%}")
+    if backtest.overlapping:
+        print(f"passed over {backtest.overlapping} signals that came while a position in the same "
+              f"instrument was still open")
     if backtest.untradeable:
         print(f"skipped {backtest.untradeable} hits with no bar after the prediction to sell on")
 

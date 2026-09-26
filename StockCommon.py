@@ -477,47 +477,45 @@ def evaluate(model, x, y, device, thresholds=(0.3, 0.5, 0.7), batch_size: int = 
     return report, probabilities
 
 
-def write_hits(path: str, datasets, origins, labels, probabilities, top: int, margin: int, label: int = 1):
-    """Write the `top` most confident test windows whose label was `label`, with `margin` rows
-    of context either side.
+def write_hits(path: str, datasets, origins, labels, probabilities, margin: int, label: int = 1):
+    """Write every test window whose label was `label`, with `margin` rows of context either side.
 
-    With the default `label` of 1 a hit is a window the model got right -- a true positive.
-    With 0 it is one the model got wrong -- a false positive, the confident call on a move
-    that never came. Either way hits are taken in order of the model's probability. What gets written is the bar the window ended on, which
-    is the bar the prediction was made from, surrounded by the rows before and after it so the
-    move the model spotted can be read off the file.
+    With the default `label` of 1 those are the moves that came, with 0 the ones that
+    didn't. Nothing is left out -- not even windows next to one another -- so a backtest
+    over both files sees every prediction the model made on the test split.
 
-    Neighbouring bars tend to score alike, so the best hits cluster around the same move. A
-    hit whose context would overlap one already chosen from the same file is skipped, which
-    keeps every row in the output to a single group and spreads the `top` over distinct moves.
+    Neighbouring hits' contexts overlap, so rather than a block of rows per hit, each
+    price row a hit or its context needs is written once: per source, in time order,
+    with `row` -- its index among that source's bars -- and a `probability` that is set
+    only on the rows the prediction was made from, and blank on rows that are there as
+    context. A hit's context is the rows of its source within `margin` of its `row` and
+    on its day; `PlotHits.read_hits` puts it back together.
 
     The context stops at the ends of the hit's own day, so reading a hit's rows off the file
     never puts the previous session's prices next to this one's.
     """
-    candidates = np.flatnonzero(labels == label)
-    candidates = candidates[np.argsort(-probabilities[candidates], kind="stable")]
-    chosen = []
-    for index in candidates:
-        if len(chosen) == top:
-            break
-        file_index, row = origins[index]
-        if all(other_file != file_index or abs(other_row - row) > 2 * margin
-               for other_file, other_row in (origins[c] for c in chosen)):
-            chosen.append(index)
-
+    chosen = np.flatnonzero(labels == label)
     with open(path, "w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["hit", "source", "offset", "probability",
-                         "timestamp", "open", "high", "low", "close", "volume"])
-        for hit, index in enumerate(chosen):
-            file_index, row = origins[index]
-            dataset = datasets[file_index]
-            day = as_utc(dataset.timestamps[row]).date()
-            for context in range(max(row - margin, 0), min(row + margin + 1, len(dataset.prices))):
-                if as_utc(dataset.timestamps[context]).date() != day:
-                    continue
-                writer.writerow([hit, dataset.path, context - row, f"{probabilities[index]:.6f}",
-                                 dataset.timestamps[context].isoformat(), *dataset.prices[context]])
+        writer.writerow(["source", "row", "timestamp", "open", "high", "low", "close", "volume", "probability"])
+        for file_index, dataset in enumerate(datasets):
+            mine = chosen[origins[chosen, 0] == file_index]
+            hit_rows = origins[mine, 1]
+            days, _ = calendar_columns(dataset.timestamps)
+            _, first_of_day, day_index = np.unique(days, return_index=True, return_inverse=True)
+            last_of_day = np.append(first_of_day[1:], len(days)) - 1
+            # Mark each hit's context as +1 at its first row and -1 past its last; a row is
+            # wanted wherever the running total is positive.
+            starts = np.maximum(hit_rows - margin, first_of_day[day_index[hit_rows]])
+            stops = np.minimum(hit_rows + margin, last_of_day[day_index[hit_rows]]) + 1
+            marks = np.zeros(len(days) + 1, dtype=np.int64)
+            np.add.at(marks, starts, 1)
+            np.add.at(marks, stops, -1)
+            probability = dict(zip(hit_rows.tolist(), probabilities[mine].tolist()))
+            for row in np.flatnonzero(np.cumsum(marks)[:-1] > 0):
+                p = probability.get(row)
+                writer.writerow([dataset.path, row, dataset.timestamps[row].isoformat(), *dataset.prices[row],
+                                 "" if p is None else f"{p:.6f}"])
     return len(chosen)
 
 
@@ -601,9 +599,9 @@ def main(make_model, description: str):
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--thresholds", default="0.3,0.5,0.7",
                         help="comma-separated probabilities at which to report precision/recall on the test set")
-    parser.add_argument("--hits", help="write the correctly predicted test rows here, as CSV, and the most confident wrong ones alongside with _negative appended to the name")
-    parser.add_argument("--top", type=int, default=100,
-                        help="how many of the most confident, non-overlapping predictions --hits writes to each file")
+    parser.add_argument("--hits", help="write every test window whose move came here, as CSV, with its probability "
+                                       "and context, and every one whose move didn't alongside, with _negative "
+                                       "appended to the name")
 
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save", help="where to write the trained weights and normalisation statistics")
@@ -668,17 +666,15 @@ def main(make_model, description: str):
               f"precision {scores['precision']:.2%}, recall {scores['recall']:.2%}, F1 {scores['f1']:.3f}")
 
     if args.hits:
-        # The model's most confident calls are the ones worth looking at row by row.
-        written = write_hits(args.hits, datasets, origins[2], splits[2][1], probabilities,
-                             args.top, args.horizon)
-        print(f"wrote the top {written} non-overlapping correct predictions "
+        # Every test prediction, split by what actually happened, for backtesting and plotting.
+        written = write_hits(args.hits, datasets, origins[2], splits[2][1], probabilities, args.horizon)
+        print(f"wrote all {written} test windows whose move came "
               f"(with {args.horizon} rows either side) to {args.hits}")
-        # And the calls it was just as sure of but got wrong, for comparison.
         stem, extension = os.path.splitext(args.hits)
         negative_path = f"{stem}_negative{extension}"
         written = write_hits(negative_path, datasets, origins[2], splits[2][1], probabilities,
-                             args.top, args.horizon, label=0)
-        print(f"wrote the top {written} non-overlapping wrong predictions "
+                             args.horizon, label=0)
+        print(f"wrote all {written} test windows whose move didn't come "
               f"(with {args.horizon} rows either side) to {negative_path}")
 
     if args.save:
