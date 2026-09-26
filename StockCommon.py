@@ -39,10 +39,13 @@ FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close",
 
 
 def feature_names(moving_averages=(), minute_moving_averages=()):
-    """The fixed features followed by one close-versus-average channel per moving-average window,
-    the day-long averages first."""
-    return (FEATURE_NAMES + [f"close_vs_ma{window}" for window in moving_averages]
-            + [f"close_vs_ma{window}min" for window in minute_moving_averages])
+    """The fixed features followed by two channels per moving-average window -- the close against
+    the average, then the average's change -- the day-long averages first."""
+    return (FEATURE_NAMES
+            + [name for window in moving_averages
+               for name in (f"close_vs_ma{window}", f"ma{window}_change")]
+            + [name for window in minute_moving_averages
+               for name in (f"close_vs_ma{window}min", f"ma{window}min_change")])
 
 # The only bars the model ever sees, inclusive of both ends. Everything outside is
 # dropped as it is read, so the session boundaries look to the rest of the code exactly
@@ -149,6 +152,11 @@ def bars_into_day(days):
 def daily_moving_average(close, days, window: int):
     """Per row, the mean of the last `window` days' closing prices, *not* counting the row's own day.
 
+    Also returns the average's day-on-day change, as a fraction: today's average against
+    yesterday's. The average only moves when a day finishes, so a bar-to-bar change would
+    be zero everywhere a window can see; this is the one that says which way it's heading.
+    It needs a day more history than the average itself, and is NaN until it has it.
+
     A day's close is its last in-session bar, and today's hasn't happened yet, so only
     finished days go into the average: a bar at 14:00 can't know where 19:55 will be.
     Days are the ones present in the data, i.e. trading days. Rows without `window`
@@ -162,7 +170,8 @@ def daily_moving_average(close, days, window: int):
     # Entry k is the mean of daily closes k-window .. k-1, for every day k with that many before it.
     averages = np.full(len(daily_close), np.nan)
     averages[window:] = (cumulative[window:-1] - cumulative[:-window - 1]) / window
-    return averages[day_index]
+    change = np.concatenate([[np.nan], averages[1:] / averages[:-1] - 1.0])
+    return averages[day_index], change[day_index]
 
 
 def minute_moving_average(close, days, minutes, window: int):
@@ -172,13 +181,19 @@ def minute_moving_average(close, days, minutes, window: int):
     bars rather than stretching it further back. Rows less than `window` minutes after
     their day's first bar get NaN -- the average would reach into yesterday, or be over
     less time than it claims.
+
+    Also returns the average's change since the previous bar, as a fraction. That is NaN
+    wherever either average is -- including a day's first bar, whose previous bar is
+    yesterday's -- so it too never crosses a day.
     """
     _, first_of_day, day_index = np.unique(days, return_index=True, return_inverse=True)
     start = np.searchsorted(minutes, minutes - window + 1)
     cumulative = np.concatenate([[0.0], np.cumsum(close)])
     end = np.arange(1, len(close) + 1)
     averages = (cumulative[end] - cumulative[start]) / (end - start)
-    return np.where(minutes - window + 1 >= minutes[first_of_day][day_index], averages, np.nan)
+    averages = np.where(minutes - window + 1 >= minutes[first_of_day][day_index], averages, np.nan)
+    change = np.concatenate([[np.nan], np.where(days[1:] == days[:-1], averages[1:] / averages[:-1] - 1.0, np.nan)])
+    return averages, change
 
 
 def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
@@ -200,15 +215,17 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
     the close therefore have fewer chances, which is why the clock is a feature: with
     no notion of time the model could only average over "how much day is left".
 
-    Each of `moving_averages` adds a channel: how far the close sits above or below the
-    moving average of that many previous days' closes, as a fraction, so it too is
+    Each of `moving_averages` adds two channels: how far the close sits above or below the
+    moving average of that many previous days' closes, and how much that average moved
+    since the previous day, both as fractions, so they too are
     scale-free. These are the one deliberate exception to staying inside a day -- a
     multi-day trend is the point of them -- but they only look back at finished days.
     Rows too early in the file to have the longest average are NaN, and `windows` skips them.
 
-    Each of `minute_moving_averages` adds the same kind of channel against the mean close
-    over that many minutes of the same day. Those stay inside the day, so rows in the
-    first `window` minutes of each session are NaN too.
+    Each of `minute_moving_averages` adds the same two channels against the mean close
+    over that many minutes of the same day, the change being since the previous bar.
+    Those stay inside the day, so rows in the first `window` minutes of each session
+    are NaN too.
     """
     open_, high, low, close, volume = (prices[:, i] for i in range(5))
 
@@ -216,10 +233,11 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
     overnight = days[1:] != days[:-1]
     # Computed on every row, the first included, so row 0 can still close its day.
     minutes = minute_number(days, time_of_day)
-    close_vs_averages = ([close[1:] / daily_moving_average(close, days, n)[1:] - 1.0
-                          for n in moving_averages]
-                         + [close[1:] / minute_moving_average(close, days, minutes, n)[1:] - 1.0
-                            for n in minute_moving_averages])
+    # Per window, as `feature_names` lists them: the close against the average, then its change.
+    averages = ([daily_moving_average(close, days, n) for n in moving_averages]
+                + [minute_moving_average(close, days, minutes, n) for n in minute_moving_averages])
+    close_vs_averages = [column[1:] for average, change in averages
+                         for column in (close / average - 1.0, change)]
     days, time_of_day = days[1:], time_of_day[1:]
 
     # Zero is a placeholder, not a measurement: `windows` never lets these rows reach the
