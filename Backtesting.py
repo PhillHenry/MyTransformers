@@ -19,7 +19,6 @@ same instrument was still open, which are passed over. Trades never overlap on o
 instrument, so the combined line is what the strategy would have made.
 """
 import argparse
-import os
 from typing import NamedTuple
 
 import numpy as np
@@ -127,7 +126,7 @@ def main():
     parser.add_argument("--horizon", type=int, required=True,
                         help="bars after the buy to wait for the target, and to average over if it never comes; "
                              "the model's --horizon, or less, since that is all the file holds")
-    parser.add_argument("--trades", help="write every simulated trade here, as CSV")
+    parser.add_argument("--trades", help="write every simulated trade here, as CSV, most confident first")
     args = parser.parse_args()
 
     if args.horizon < 1:
@@ -136,10 +135,6 @@ def main():
 
     backtest = Backtest(args.threshold, args.target, args.horizon)
     trades = backtest.run(paths)
-    for trade in trades:
-        print(f"{trade.timestamp:%Y-%m-%d %H:%M}  {os.path.basename(trade.source).split('_')[0]:6s} "
-              f"p={trade.probability:.3f}  bought {trade.entry:.2f}  sold {trade.exit:.2f} "
-              f"({trade.exit_reason}, {trade.bars_held} bars, to {trade.exit_timestamp:%H:%M})  {trade.gain:+.3%}")
     for path in paths:
         print(f"{path}: {Backtest.summary([t for t in trades if t.hits_file == path])}")
     if len(paths) > 1:
@@ -153,7 +148,8 @@ def main():
         print(f"skipped {backtest.untradeable} hits with no bar after the prediction to sell on")
 
     if args.trades:
-        pd.DataFrame([{**trade._asdict(), "gain": trade.gain} for trade in trades]).to_csv(args.trades, index=False)
+        by_probability = sorted(trades, key=lambda trade: trade.probability, reverse=True)
+        pd.DataFrame([{**trade._asdict(), "gain": trade.gain} for trade in by_probability]).to_csv(args.trades, index=False)
         print(f"wrote {len(trades)} trades to {args.trades}")
 
 
