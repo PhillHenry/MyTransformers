@@ -24,7 +24,8 @@ The same-calendar-day constraint means the effective horizon shrinks as the sess
 runs down, so the timestamp itself becomes predictive and is fed in as a feature.
 
 With --baseline, another file -- an index, say -- has the same features computed on its
-own bars, and they are set beside each file's, minute by minute.
+own bars, and they are set beside each file's, minute by minute, followed by the
+correlation of the two closes over each of the minute moving averages' spans.
 """
 import argparse
 import csv
@@ -48,14 +49,16 @@ CLOCK_FEATURES = ["time_of_day", "bars_elapsed_today"]
 def feature_names(moving_averages=(), minute_moving_averages=(), baseline: bool = False):
     """The fixed features followed by two channels per moving-average window -- the close against
     the average, then the average's change -- the day-long averages first. With a baseline, its
-    own copy of all of those but the clock follows, each prefixed `baseline_`."""
+    own copy of all of those but the clock follows, each prefixed `baseline_`, then the close's
+    correlation with the baseline's over each minute moving average's span."""
     names = (FEATURE_NAMES
              + [name for window in moving_averages
                 for name in (f"close_vs_ma{window}", f"ma{window}_change")]
              + [name for window in minute_moving_averages
                 for name in (f"close_vs_ma{window}min", f"ma{window}min_change")])
     if baseline:
-        names += [f"baseline_{name}" for name in names if name not in CLOCK_FEATURES]
+        names += ([f"baseline_{name}" for name in names if name not in CLOCK_FEATURES]
+                  + [f"close_baseline_corr{window}min" for window in minute_moving_averages])
     return names
 
 # The only bars the model ever sees, inclusive of both ends. Everything outside is
@@ -293,6 +296,7 @@ class Baseline(NamedTuple):
     path: str
     minutes: np.ndarray                                      # sorted, one per row of `features`
     features: np.ndarray
+    close: np.ndarray                                        # one per row of `features`
 
 
 def read_baseline(path: str, moving_averages=(), minute_moving_averages=()):
@@ -309,7 +313,15 @@ def read_baseline(path: str, moving_averages=(), minute_moving_averages=()):
     names = feature_names(moving_averages, minute_moving_averages)
     features = np.delete(features, [names.index(name) for name in CLOCK_FEATURES], axis=1)
     features[bars_into_day(days[1:]) == 0] = np.nan
-    return Baseline(path, minute_number(days, time_of_day)[1:], features)
+    return Baseline(path, minute_number(days, time_of_day)[1:], features, prices[1:, 3])
+
+
+def baseline_rows(minutes, baseline: Baseline):
+    """Per minute, the baseline row from that same minute, and whether the baseline has one at all."""
+    if not len(baseline.minutes):
+        return np.zeros(len(minutes), dtype=np.int64), np.zeros(len(minutes), dtype=bool)
+    position = np.searchsorted(baseline.minutes, minutes).clip(max=len(baseline.minutes) - 1)
+    return position, baseline.minutes[position] == minutes
 
 
 def join_baseline(features, minutes, baseline: Baseline):
@@ -320,11 +332,43 @@ def join_baseline(features, minutes, baseline: Baseline):
     `windows` skips any window with a NaN in it.
     """
     joined = np.full((len(features), baseline.features.shape[1]), np.nan, dtype=np.float32)
-    if len(baseline.minutes):
-        position = np.searchsorted(baseline.minutes, minutes).clip(max=len(baseline.minutes) - 1)
-        found = baseline.minutes[position] == minutes
-        joined[found] = baseline.features[position[found]]
+    position, found = baseline_rows(minutes, baseline)
+    joined[found] = baseline.features[position[found]]
     return np.concatenate([features, joined], axis=1)
+
+
+def baseline_correlation(close, days, minutes, baseline: Baseline, window: int):
+    """Per row, the Pearson correlation of the close with the baseline's over the last `window`
+    minutes of the row's own day, itself included.
+
+    Like `minute_moving_average`, the span is clock time, and rows less than `window` minutes
+    after their day's first bar get NaN. Only the minutes both files have are paired; fewer
+    than two pairs is NaN. A span where either close never moves has no correlation to
+    speak of, and gets zero rather than a NaN that would cost every window over it.
+    """
+    _, first_of_day, day_index = np.unique(days, return_index=True, return_inverse=True)
+    position, found = baseline_rows(minutes, baseline)
+    other = np.where(found, baseline.close[position], np.nan)
+    n = len(close)
+    # Column k holds the row k bars back, kept only when it lies inside the span.
+    x, y = np.full((n, window), np.nan), np.full((n, window), np.nan)
+    for k in range(min(window, n)):
+        inside = minutes[k:] - minutes[:n - k] < window
+        x[k:, k] = np.where(inside, close[:n - k], np.nan)
+        y[k:, k] = np.where(inside, other[:n - k], np.nan)
+    paired = ~np.isnan(x) & ~np.isnan(y)
+    count = paired.sum(axis=1)
+    x_mean = np.where(paired, x, 0.0).sum(axis=1) / np.maximum(count, 1)
+    y_mean = np.where(paired, y, 0.0).sum(axis=1) / np.maximum(count, 1)
+    dx = np.where(paired, x - x_mean[:, None], 0.0)
+    dy = np.where(paired, y - y_mean[:, None], 0.0)
+    sxx, syy, sxy = (dx * dx).sum(axis=1), (dy * dy).sum(axis=1), (dx * dy).sum(axis=1)
+    # Rounding leaves a flat price a hair of variance; anything below a part in 10^9 is flat.
+    moves = (sxx > count * (1e-9 * x_mean) ** 2) & (syy > count * (1e-9 * y_mean) ** 2)
+    correlation = np.where(moves, sxy / np.sqrt(np.where(moves, sxx * syy, 1.0)), 0.0)
+    correlation[count < 2] = np.nan
+    correlation[minutes - window + 1 < minutes[first_of_day][day_index]] = np.nan
+    return correlation
 
 
 def windows(features, labels, days, minutes, window: int):
@@ -380,7 +424,10 @@ def dataset_from_csv(path: str, window: int, horizon: int, target: float,
                                            moving_averages, minute_moving_averages)
     minutes = minute_number(days, time_of_day)[1:]
     if baseline is not None:
-        features = join_baseline(features, minutes, baseline)
+        correlations = [baseline_correlation(prices[1:, 3], days[1:], minutes, baseline, n)[:, None]
+                        for n in minute_moving_averages]
+        features = np.concatenate([join_baseline(features, minutes, baseline), *correlations],
+                                  axis=1).astype(np.float32)
     x, y, ends = windows(features, labels, days[1:], minutes, window)
     # Features start at row 1 -- row 0 has no previous bar to take a return from -- so a
     # window ending at feature `end` is a window ending at price row `end + 1`.
@@ -593,7 +640,9 @@ def main(make_model, description: str):
     parser.add_argument("--baseline",
                         help="a CSV in the same format -- an index, say -- whose features, moving averages "
                              "and their changes included, are set beside every file's own, matched by "
-                             "minute. Windows over a minute the baseline lacks are skipped")
+                             "minute, along with the close's correlation with the baseline's over each "
+                             "--minute-moving-averages span. Windows over a minute the baseline lacks "
+                             "are skipped")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
