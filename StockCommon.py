@@ -432,11 +432,34 @@ def dataset_from_csv(path: str, window: int, horizon: int, target: float,
     # Features start at row 1 -- row 0 has no previous bar to take a return from -- so a
     # window ending at feature `end` is a window ending at price row `end + 1`.
     dataset = Dataset(path, x, y, ends + 1, timestamps, prices)
-    positive = y.mean() if len(y) else float("nan")
+    _, window_days = np.unique(days[ends + 1], return_inverse=True)
+    reached = any_per_day(window_days, y == 1)
     median_bars = int(np.median(bars_per_day)) if len(bars_per_day) else 0
     return dataset, (f"{len(prices)} minutes in session over {len(unique_days)} calendar days, "
                      f"median {median_bars} per day, "
-                     f"{len(x)} windows, {positive:.2%} positive")
+                     f"{len(x)} windows over {len(reached)} days, "
+                     f"target reached on {int(reached.sum())} of them")
+
+
+def window_days(datasets, origins):
+    """Per window, the index of the (file, calendar day) it ended on, numbered from 0.
+
+    Overlapping windows on one day all see the same move, so counting windows counts a
+    single 2% rise many times over. Counts are made per day instead: this is the key.
+    """
+    days = np.zeros(len(origins), dtype=np.int64)
+    for file_index, dataset in enumerate(datasets):
+        mine = origins[:, 0] == file_index
+        days[mine], _ = calendar_columns([dataset.timestamps[row] for row in origins[mine, 1]])
+    _, index = np.unique(np.stack([origins[:, 0], days], axis=1), axis=0, return_inverse=True)
+    return index.reshape(-1)
+
+
+def any_per_day(days, flags):
+    """Per day in `days` (as `window_days` numbers them), whether any of its windows' `flags` is set."""
+    result = np.zeros(days.max() + 1 if len(days) else 0, dtype=bool)
+    np.logical_or.at(result, days, flags)
+    return result
 
 
 def chronological_split(x, y, window: int, horizon: int, fractions=(0.7, 0.15)):
@@ -505,22 +528,34 @@ def roc_auc(labels, scores):
     return (ranks[labels == 1].sum() - positives * (positives + 1) / 2) / (positives * negatives)
 
 
-def evaluate(model, x, y, device, thresholds=(0.3, 0.5, 0.7), batch_size: int = 4096):
+def evaluate(model, x, y, device, thresholds=(0.3, 0.5, 0.7), batch_size: int = 4096, days=None):
+    """AUC over windows, and base rate, precision and recall over `days` (see `window_days`).
+
+    A day counts once however many of its windows reached the target or were signalled:
+    it is signalled if any window on it scored at or above the threshold, correct if any
+    signalled window on it reached the target, and reached if any window on it did.
+    Without `days` every window is a day of its own.
+    """
+    if days is None:
+        days = np.arange(len(y))
     model.eval()
     # In batches: a whole split through an LSTM at once needs far more memory than a GPU has.
     with torch.no_grad():
         probabilities = np.concatenate([
             torch.sigmoid(model(torch.from_numpy(x[start:start + batch_size]).to(device))).cpu().numpy()
             for start in range(0, len(x), batch_size)]) if len(x) else np.empty(0, dtype=np.float32)
-    report = {"auc": roc_auc(y, probabilities), "base_rate": float(y.mean()), "thresholds": {}}
+    reached = any_per_day(days, y == 1)
+    report = {"auc": roc_auc(y, probabilities), "base_rate": float(reached.mean()) if len(reached) else float("nan"),
+              "days": len(reached), "reached": int(reached.sum()), "thresholds": {}}
     for threshold in thresholds:
         predicted = probabilities >= threshold
-        true_positives = float((predicted & (y == 1)).sum())
-        precision = true_positives / max(predicted.sum(), 1)
-        recall = true_positives / max((y == 1).sum(), 1)
+        signalled = any_per_day(days, predicted)
+        true_positives = float(any_per_day(days, predicted & (y == 1)).sum())
+        precision = true_positives / max(signalled.sum(), 1)
+        recall = true_positives / max(reached.sum(), 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-9)
         report["thresholds"][threshold] = {"precision": precision, "recall": recall, "f1": f1,
-                                           "signals": int(predicted.sum())}
+                                           "signals": int(signalled.sum())}
     return report, probabilities
 
 
@@ -691,33 +726,41 @@ def main(make_model, description: str):
         raise SystemExit(f"none of the files held a full window of labelled rows between "
                          f"{SESSION_START:%H:%M} and {SESSION_END:%H:%M} UTC")
 
-    positives = sum(float(dataset.y.sum()) for dataset in datasets)
+    all_origins = np.concatenate([np.stack([np.full(len(dataset.rows), file_index), dataset.rows], axis=1)
+                                  for file_index, dataset in enumerate(datasets)])
+    reached = any_per_day(window_days(datasets, all_origins), np.concatenate([dataset.y for dataset in datasets]) == 1)
+    positives = int(reached.sum())
     total = sum(len(dataset.y) for dataset in datasets)
     print(f"{total} windows of shape {datasets[0].x.shape[1:]} from {len(datasets)} "
-          f"file{'s' if len(datasets) > 1 else ''}, {positives / total:.2%} of them positive")
+          f"file{'s' if len(datasets) > 1 else ''}, over {len(reached)} days, "
+          f"target reached on {positives} ({positives / len(reached):.2%}) of them")
     if positives == 0:
         raise SystemExit("no positive examples: with one bar per day (or coarser) the same-day "
                          "constraint can never be met, so the label is always 0")
 
     splits, origins = combined_splits(datasets, args.window, args.horizon)
     splits, mean, std = normalise(splits)
-    for name, (split_x, split_y) in zip(("train", "validation", "test"), splits):
-        print(f"{name:10s} {len(split_x):6d} windows, {split_y.mean():.2%} positive")
+    days = [window_days(datasets, split_origins) for split_origins in origins]
+    for name, (split_x, split_y), split_days in zip(("train", "validation", "test"), splits, days):
+        reached = any_per_day(split_days, split_y == 1)
+        print(f"{name:10s} {len(split_x):6d} windows over {len(reached):5d} days, "
+              f"target reached on {int(reached.sum())} ({reached.mean():.2%}) of them")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = make_model(splits[0][0].shape[1]).to(device)
     train(model, splits[0], splits[1], device, args.epochs, args.batch_size, args.learning_rate)
 
-    report, probabilities = evaluate(model, *splits[2], device, thresholds)
-    print(f"\ntest AUC {report['auc']:.4f} against a base rate of {report['base_rate']:.2%}")
+    report, probabilities = evaluate(model, *splits[2], device, thresholds, days=days[2])
+    print(f"\ntest AUC {report['auc']:.4f} (per window); target reached on {report['reached']} "
+          f"of {report['days']} days, a base rate of {report['base_rate']:.2%}")
     for threshold, scores in report["thresholds"].items():
-        print(f"  p>={threshold}: {scores['signals']:5d} signals, "
+        print(f"  p>={threshold}: {scores['signals']:5d} days signalled, "
               f"precision {scores['precision']:.2%}, recall {scores['recall']:.2%}, F1 {scores['f1']:.3f}")
 
     if args.hits:
         # Every test prediction, split by what actually happened, for backtesting and plotting.
         written = write_hits(args.hits, datasets, origins[2], splits[2][1], probabilities, args.horizon)
-        print(f"wrote all {written} test windows whose move came "
+        print(f"wrote all {written} test windows whose move came, on {report['reached']} days, "
               f"(with {args.horizon} rows either side) to {args.hits}")
         stem, extension = os.path.splitext(args.hits)
         negative_path = f"{stem}_negative{extension}"
