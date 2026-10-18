@@ -39,7 +39,7 @@ import torch
 from torch import nn
 
 FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close", "abs_open_vs_close",
-                 "log_volume_change", "time_of_day", "bars_elapsed_today"]
+                 "log_volume_change", "volume_change", "time_of_day", "bars_elapsed_today"]
 
 
 # The features that describe the clock rather than the instrument: a baseline shares them.
@@ -277,6 +277,8 @@ def bar_features(prices, days, time_of_day, moving_averages=(), minute_moving_av
     # model, and an overnight gap left in place would be the largest "return" in the file.
     log_return = np.where(overnight, 0.0, np.diff(np.log(close)))
     log_volume_change = np.where(overnight, 0.0, np.diff(np.log1p(volume)))
+    # The raw difference in shares traded, unlike everything else here not scale-free.
+    volume_change = np.where(overnight, 0.0, np.diff(volume))
     # The rest compare a bar with itself, so they are intraday whatever day they fall on.
     high_vs_close = (high[1:] / close[1:]) - 1.0
     low_vs_close = (low[1:] / close[1:]) - 1.0
@@ -289,7 +291,7 @@ def bar_features(prices, days, time_of_day, moving_averages=(), minute_moving_av
     bars_elapsed = bars_into_day(days)
 
     features = np.stack([log_return, high_vs_close, low_vs_close, open_vs_close, abs_open_vs_close,
-                         log_volume_change, time_of_day, np.log1p(bars_elapsed), *close_vs_averages], axis=1)
+                         log_volume_change, volume_change, time_of_day, np.log1p(bars_elapsed), *close_vs_averages], axis=1)
     return features.astype(np.float32)
 
 
