@@ -46,16 +46,39 @@ FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close",
 CLOCK_FEATURES = ["time_of_day", "bars_elapsed_today"]
 
 
+# Each series that gets moving averages, in `feature_names` order, and the prefix of its
+# averages' change channels -- none for the close, whose names predate the others.
+AVERAGED_SERIES = [("close", ""), ("volume", "volume_"), ("volume_change", "volume_change_")]
+
+
+def ratio(value, average):
+    """How far `value` sits above `average`, as a fraction: the close's comparison."""
+    return value / average - 1.0
+
+
+def log1p_difference(value, average):
+    """The volume's comparison. A ratio would be 0/0 on the many bars an index reports no
+    volume for; this is near it whenever the volume is not, and zero when neither trades."""
+    return np.log1p(value) - np.log1p(average)
+
+
+def difference(value, average):
+    """The volume change's comparison. It is as often negative as positive, so its average
+    hovers around zero and a ratio against it would be meaningless."""
+    return value - average
+
+
 def feature_names(moving_averages=(), minute_moving_averages=(), baseline: bool = False):
     """The fixed features followed by two channels per moving-average window -- the close against
     the average, then the average's change -- the day-long averages first. With a baseline, its
     own copy of all of those but the clock follows, each prefixed `baseline_`, then the close's
     correlation with the baseline's over each minute moving average's span."""
-    names = (FEATURE_NAMES
-             + [name for window in moving_averages
-                for name in (f"close_vs_ma{window}", f"ma{window}_change")]
-             + [name for window in minute_moving_averages
-                for name in (f"close_vs_ma{window}min", f"ma{window}min_change")])
+    names = FEATURE_NAMES[:]
+    for series, prefix in AVERAGED_SERIES:
+        names += ([name for window in moving_averages
+                   for name in (f"{series}_vs_ma{window}", f"{prefix}ma{window}_change")]
+                  + [name for window in minute_moving_averages
+                     for name in (f"{series}_vs_ma{window}min", f"{prefix}ma{window}min_change")])
     if baseline:
         names += ([f"baseline_{name}" for name in names if name not in CLOCK_FEATURES]
                   + [f"close_baseline_corr{window}min" for window in minute_moving_averages])
@@ -163,13 +186,17 @@ def bars_into_day(days):
     return np.arange(len(days)) - np.repeat(first_of_day, np.diff(np.append(first_of_day, len(days))))
 
 
-def daily_moving_average(close, days, window: int):
+def daily_moving_average(close, days, window: int, compare=ratio, per_bar: bool = False):
     """Per row, the mean of the last `window` days' closing prices, *not* counting the row's own day.
+
+    With `per_bar`, a day's value is the mean of its bars rather than its last one -- what a
+    day of volume amounts to, on the scale of a single bar.
 
     Also returns the average's day-on-day change, as a fraction: today's average against
     yesterday's. The average only moves when a day finishes, so a bar-to-bar change would
     be zero everywhere a window can see; this is the one that says which way it's heading.
     It needs a day more history than the average itself, and is NaN until it has it.
+    It is `compare(today's average, yesterday's)`.
 
     A day's close is its last in-session bar, and today's hasn't happened yet, so only
     finished days go into the average: a bar at 14:00 can't know where 19:55 will be.
@@ -179,16 +206,17 @@ def daily_moving_average(close, days, window: int):
     """
     _, first_of_day, day_index = np.unique(days, return_index=True, return_inverse=True)
     last_of_day = np.append(first_of_day[1:], len(days)) - 1
-    daily_close = close[last_of_day]
+    daily_close = (np.add.reduceat(close, first_of_day) / np.diff(np.append(first_of_day, len(close)))
+                   if per_bar else close[last_of_day])
     cumulative = np.concatenate([[0.0], np.cumsum(daily_close)])
     # Entry k is the mean of daily closes k-window .. k-1, for every day k with that many before it.
     averages = np.full(len(daily_close), np.nan)
     averages[window:] = (cumulative[window:-1] - cumulative[:-window - 1]) / window
-    change = np.concatenate([[np.nan], averages[1:] / averages[:-1] - 1.0])
+    change = np.concatenate([[np.nan], compare(averages[1:], averages[:-1])])
     return averages[day_index], change[day_index]
 
 
-def minute_moving_average(close, days, minutes, window: int):
+def minute_moving_average(close, days, minutes, window: int, compare=ratio):
     """Per row, the mean close over the last `window` minutes of the row's own day, itself included.
 
     The span is clock time, not rows: a missing minute leaves the average over fewer
@@ -196,7 +224,7 @@ def minute_moving_average(close, days, minutes, window: int):
     their day's first bar get NaN -- the average would reach into yesterday, or be over
     less time than it claims.
 
-    Also returns the average's change since the previous bar, as a fraction. That is NaN
+    Also returns the average's change since the previous bar, `compare(now, before)`. That is NaN
     wherever either average is -- including a day's first bar, whose previous bar is
     yesterday's -- so it too never crosses a day.
     """
@@ -206,7 +234,7 @@ def minute_moving_average(close, days, minutes, window: int):
     end = np.arange(1, len(close) + 1)
     averages = (cumulative[end] - cumulative[start]) / (end - start)
     averages = np.where(minutes - window + 1 >= minutes[first_of_day][day_index], averages, np.nan)
-    change = np.concatenate([[np.nan], np.where(days[1:] == days[:-1], averages[1:] / averages[:-1] - 1.0, np.nan)])
+    change = np.concatenate([[np.nan], np.where(days[1:] == days[:-1], compare(averages[1:], averages[:-1]), np.nan)])
     return averages, change
 
 
@@ -240,6 +268,10 @@ def features_and_labels(prices, days, time_of_day, horizon: int, target: float,
     over that many minutes of the same day, the change being since the previous bar.
     Those stay inside the day, so rows in the first `window` minutes of each session
     are NaN too.
+
+    Both kinds of average are taken of the volume and of its bar-to-bar change as well,
+    each with the same two channels. The volume's are compared as differences of log1p --
+    an index's volume is usually zero -- and its change's as plain differences, in shares.
     """
     features = bar_features(prices, days, time_of_day, moving_averages, minute_moving_averages)
     close_, high_, days = prices[1:, 3], prices[1:, 1], days[1:]
@@ -266,11 +298,20 @@ def bar_features(prices, days, time_of_day, moving_averages=(), minute_moving_av
     overnight = days[1:] != days[:-1]
     # Computed on every row, the first included, so row 0 can still close its day.
     minutes = minute_number(days, time_of_day)
-    # Per window, as `feature_names` lists them: the close against the average, then its change.
-    averages = ([daily_moving_average(close, days, n) for n in moving_averages]
-                + [minute_moving_average(close, days, minutes, n) for n in minute_moving_averages])
-    close_vs_averages = [column[1:] for average, change in averages
-                         for column in (close / average - 1.0, change)]
+    # Bar-to-bar volume change over every row, zero where it would span midnight -- row 0
+    # included -- so averages over a day's opening minutes don't reach into yesterday.
+    volume_delta = np.concatenate([[0.0], np.where(days[1:] == days[:-1], np.diff(volume), 0.0)])
+    # Per series, then per window, as `feature_names` lists them: the series against the
+    # average, then the average's change. Volumes are averaged per bar over days, not taken
+    # from a day's last bar, which is no more representative of its volume than any other.
+    vs_averages = []
+    for series, compare, per_bar in ((close, ratio, False), (volume, log1p_difference, True),
+                                     (volume_delta, difference, True)):
+        averages = ([daily_moving_average(series, days, n, compare, per_bar) for n in moving_averages]
+                    + [minute_moving_average(series, days, minutes, n, compare)
+                       for n in minute_moving_averages])
+        vs_averages += [column[1:] for average, change in averages
+                        for column in (compare(series, average), change)]
     days, time_of_day = days[1:], time_of_day[1:]
 
     # Zero is a placeholder, not a measurement: `windows` never lets these rows reach the
@@ -291,7 +332,7 @@ def bar_features(prices, days, time_of_day, moving_averages=(), minute_moving_av
     bars_elapsed = bars_into_day(days)
 
     features = np.stack([log_return, high_vs_close, low_vs_close, open_vs_close, abs_open_vs_close,
-                         log_volume_change, volume_change, time_of_day, np.log1p(bars_elapsed), *close_vs_averages], axis=1)
+                         log_volume_change, volume_change, time_of_day, np.log1p(bars_elapsed), *vs_averages], axis=1)
     return features.astype(np.float32)
 
 
@@ -668,12 +709,13 @@ def main(make_model, description: str):
                         help="rows ahead the 2%% move must happen in, capped at the end of the calendar day")
     parser.add_argument("--target", type=float, default=0.02, help="the move to predict, as a fraction")
     parser.add_argument("--moving-averages", default="",
-                        help="comma-separated day counts; each adds close relative to the moving average "
-                             "of that many previous days' closes as a feature (default: none). Days "
+                        help="comma-separated day counts; each adds close, volume and volume change relative "
+                             "to their moving averages over that many previous days as features (default: none). Days "
                              "before the longest average is available produce no samples")
     parser.add_argument("--minute-moving-averages", default="",
-                        help="comma-separated minute counts; each adds close relative to the moving average "
-                             "of that many minutes of the same day's closes as a feature (default: none). "
+                        help="comma-separated minute counts; each adds close, volume and volume change relative "
+                             "to their moving averages over that many minutes of the same day as features "
+                             "(default: none). "
                              "The first minutes of each session, before the longest is available, "
                              "produce no samples")
     parser.add_argument("--baseline",
