@@ -38,8 +38,8 @@ import numpy as np
 import torch
 from torch import nn
 
-FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close", "log_volume_change",
-                 "time_of_day", "bars_elapsed_today"]
+FEATURE_NAMES = ["log_return", "high_vs_close", "low_vs_close", "open_vs_close", "abs_open_vs_close",
+                 "log_volume_change", "time_of_day", "bars_elapsed_today"]
 
 
 # The features that describe the clock rather than the instrument: a baseline shares them.
@@ -281,13 +281,15 @@ def bar_features(prices, days, time_of_day, moving_averages=(), minute_moving_av
     high_vs_close = (high[1:] / close[1:]) - 1.0
     low_vs_close = (low[1:] / close[1:]) - 1.0
     open_vs_close = (open_[1:] / close[1:]) - 1.0
+    # The bar's body without its direction, as a fraction of the close to stay scale-free.
+    abs_open_vs_close = np.abs(open_[1:] - close[1:]) / close[1:]
 
     # How far into its day each bar is, counted in bars: the clock as the data actually
     # samples it, which is what limits how many chances the 2% move has left.
     bars_elapsed = bars_into_day(days)
 
-    features = np.stack([log_return, high_vs_close, low_vs_close, open_vs_close, log_volume_change,
-                         time_of_day, np.log1p(bars_elapsed), *close_vs_averages], axis=1)
+    features = np.stack([log_return, high_vs_close, low_vs_close, open_vs_close, abs_open_vs_close,
+                         log_volume_change, time_of_day, np.log1p(bars_elapsed), *close_vs_averages], axis=1)
     return features.astype(np.float32)
 
 
